@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../models/modem_models.dart';
 import '../../services/modem_controller.dart';
 
 class TerminalLogsTab extends StatefulWidget {
@@ -169,7 +170,8 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
   }
 
   Widget _buildOperationsTab() {
-    final ops = c.initialized ? c.db.getOperationLogs(limit: 500) : [];
+    final List<OperationLogEntry> ops =
+        c.initialized ? c.db.getOperationLogs(limit: 500) : const [];
 
     return Padding(
       padding: const EdgeInsets.all(14),
@@ -246,12 +248,12 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
   }
 
   Widget _buildSystemLogTab() {
-    final logs = c.initialized
+    final List<SystemLogEntry> logs = c.initialized
         ? c.db.getSystemLogs(
             limit: 500,
             level: _sysLevelFilter.isEmpty ? null : _sysLevelFilter,
           )
-        : [];
+        : const [];
 
     return Padding(
       padding: const EdgeInsets.all(14),

@@ -248,8 +248,10 @@ class ScenarioEngine {
 
     double? diff;
     String matchStatus = 'Н/Д';
-    if (firstBalance != null && lastBalance != null) {
-      diff = double.parse((lastBalance - firstBalance).toStringAsFixed(2));
+    final fb = firstBalance;
+    final lb = lastBalance;
+    if (fb != null && lb != null) {
+      diff = double.parse((lb - fb).toStringAsFixed(2));
       matchStatus = diff.abs() < 0.005 ? 'СОВПАЛ' : 'НЕ СОВПАЛ';
     }
 

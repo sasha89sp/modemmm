@@ -25,11 +25,11 @@ class TrayWindowService with WindowListener, TrayListener {
     _initialized = true;
 
     await windowManager.ensureInitialized();
-    const options = WindowOptions(
-      size: Size(1280, 820),
-      minimumSize: Size(1024, 680),
+    final options = WindowOptions(
+      size: const Size(1280, 820),
+      minimumSize: const Size(1024, 680),
       center: true,
-      title: '${AppVersion.appName} v${AppVersion.version}',
+      title: AppVersion.windowTitle,
     );
     await windowManager.waitUntilReadyToShow(options, () async {
       await windowManager.show();
@@ -43,6 +43,8 @@ class TrayWindowService with WindowListener, TrayListener {
       final iconPath = AppPaths.trayIconFile;
       if (File(iconPath).existsSync()) {
         await trayManager.setIcon(iconPath);
+      } else {
+        await trayManager.setIcon('assets/app_icon.ico');
       }
       await trayManager.setToolTip(AppVersion.windowTitle);
       await trayManager.setContextMenu(Menu(

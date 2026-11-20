@@ -32,10 +32,10 @@ class _CallsTabState extends State<CallsTab> {
   }
 
   Future<void> _dial() async {
-    final num = _dialCtrl.text.trim();
-    if (num.isEmpty || !c.snapshot.connected) return;
-    final ok = await c.modem.dialVoice(num);
-    c.db.logOperation('Звонок', 'Исходящий на $num', ok ? 'Набор' : 'Ошибка');
+    final phoneNumber = _dialCtrl.text.trim();
+    if (phoneNumber.isEmpty || !c.snapshot.connected) return;
+    final ok = await c.modem.dialVoice(phoneNumber);
+    c.db.logOperation('Звонок', 'Исходящий на $phoneNumber', ok ? 'Набор' : 'Ошибка');
     if (ok && c.settings.preferredVoicePort.isNotEmpty && !c.voice.isBridgeActive) {
       try {
         c.voice.startVoiceBridge(c.settings.preferredVoicePort);
