@@ -32,8 +32,17 @@ class VoiceService {
   bool _streamingPhrase = false;
   int _rxBytes = 0;
   int _txBytes = 0;
+  DateTime _lastCounterNotify = DateTime.fromMillisecondsSinceEpoch(0);
 
   VoiceService(this.audio, {this.onChanged});
+
+  void _notifyCountersThrottled() {
+    final now = DateTime.now();
+    if (now.difference(_lastCounterNotify).inMilliseconds >= 400) {
+      _lastCounterNotify = now;
+      onChanged?.call();
+    }
+  }
 
   bool get isBridgeActive => _bridgeActive;
   bool get isMicMuted => _micMuted;
@@ -66,7 +75,7 @@ class VoiceService {
     if (comPort.trim().isEmpty) {
       throw StateError('Не выбран звуковой COM-порт модема.');
     }
-    _voicePort.open(comPort, baudRate: 115200, readTimeoutMs: 25);
+    _voicePort.open(comPort, baudRate: 115200);
     audio.openPcmOut();
     _bridgeActive = true;
     _rxBytes = 0;
@@ -81,7 +90,7 @@ class VoiceService {
         if (!_speakerMuted) {
           audio.writePcmOut(chunk);
         }
-        onChanged?.call();
+        _notifyCountersThrottled();
       }
     });
 
@@ -93,7 +102,7 @@ class VoiceService {
       try {
         _voicePort.writeBytes(pcm);
         _txBytes += pcm.length;
-        onChanged?.call();
+        _notifyCountersThrottled();
       } catch (_) {
         stopVoiceBridge();
       }
@@ -195,7 +204,7 @@ class VoiceService {
       if (voiceComPort.trim().isEmpty) {
         throw StateError('Не задан звуковой COM-порт для воспроизведения фразы.');
       }
-      _voicePort.open(voiceComPort, baudRate: 115200, readTimeoutMs: 25);
+      _voicePort.open(voiceComPort, baudRate: 115200);
     }
 
     _streamingPhrase = true;

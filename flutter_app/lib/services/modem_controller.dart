@@ -30,9 +30,10 @@ class _LoopStats {
 }
 
 /// Главный координатор приложения:
+/// - Мгновенный запуск UI (initLocal) + асинхронная инициализация портов (startHardwareAndLoops);
 /// - USB Hotplug (мгновенное освобождение при извлечении и автопереподключение при возврате);
 /// - адаптивные интервалы (активный / простой / свёрнуто / 60с при отсутствии SIM);
-/// - пропуск перерисовок при неизменном снимке состояния;
+/// - кэширование счётчика непрочитанных SMS и пропуск лишних перерисовок UI;
 /// - автосинхронизация SMS (+CMTI и расписание) + звуковое оповещение winmm.dll;
 /// - автозапуск сценариев при регистрации в сети с защитой от повтора в сессии;
 /// - телеметрия длительности фоновых циклов DIAG.
@@ -63,16 +64,29 @@ class ModemController extends ChangeNotifier {
   String? lastToastMessage;
   bool busy = false;
   bool initialized = false;
+  bool _hardwareStarted = false;
+
+  // Кэш и версии данных (исключают синхронные SQLite-запросы на каждом кадре build())
+  int _unreadSmsCount = 0;
+  int smsDataVersion = 0;
+  int logsDataVersion = 0;
 
   // Энергосбережение и состояние окна
   bool _windowHiddenOrMinimized = false;
   DateTime _lastUserActivity = DateTime.now();
 
-  // Таймеры фоновых циклов
+  // Таймеры фоновых циклов и защита от перекрытия (re-entrancy guards)
   Timer? _usbWatchTimer;
   Timer? _urcPollTimer;
   Timer? _statusLoopTimer;
   Timer? _smsLoopTimer;
+  Timer? _atNotifyDebounce;
+
+  bool _usbLoopRunning = false;
+  bool _statusLoopRunning = false;
+  bool _smsLoopRunning = false;
+  bool _scanningPorts = false;
+  bool _disposed = false;
 
   Set<String> _knownPortNames = {};
   final Set<String> _autoRunCompletedSessions = {};
@@ -89,21 +103,25 @@ class ModemController extends ChangeNotifier {
       onUnsolicitedLine: _handleUnsolicitedLine,
     );
     modem = HuaweiE173Service(serial, onLog: _handleAtLog);
-    voice = VoiceService(audio, onChanged: notifyListeners);
+    voice = VoiceService(audio, onChanged: _safeNotify);
     scenarioEngine = ScenarioEngine(
       modem: modem,
       db: db,
       voice: voice,
       syncSmsNow: () => syncSmsFromModem(silent: true),
       onProgress: (line) {
-        scenarioProgressLog.insert(0, '[${DatabaseService.nowIso().substring(11)}] $line');
+        scenarioProgressLog.insert(
+          0,
+          '[${DatabaseService.nowIso().substring(11)}] $line',
+        );
         if (scenarioProgressLog.length > 300) scenarioProgressLog.removeLast();
-        notifyListeners();
+        _safeNotify();
       },
     );
   }
 
-  int get unreadSmsCount => initialized ? db.getUnreadInboxCount() : 0;
+  int get unreadSmsCount => _unreadSmsCount;
+  bool get scanningPorts => _scanningPorts;
   bool get isWindowHidden => _windowHiddenOrMinimized;
   bool get isIdle =>
       DateTime.now().difference(_lastUserActivity).inSeconds >= 90;
@@ -123,7 +141,7 @@ class ModemController extends ChangeNotifier {
           maxDurationMs: _usbStats.maxMs,
           executions: _usbStats.count,
           currentIntervalSec: _windowHiddenOrMinimized ? 6 : 3,
-          stateNote: _windowHiddenOrMinimized ? 'Окно скрыто' : 'Активен',
+          stateNote: _windowHiddenOrMinimized ? 'Окно скрыто' : 'Активен (Win32 реестр)',
         ),
         DiagMetric(
           loopName: 'Мониторинг модема/сети',
@@ -153,40 +171,72 @@ class ModemController extends ChangeNotifier {
         ),
       ];
 
+  void _safeNotify() {
+    if (!_disposed) {
+      notifyListeners();
+    }
+  }
+
+  void _refreshUnreadCache() {
+    if (!initialized) return;
+    _unreadSmsCount = db.getUnreadInboxCount();
+    smsDataVersion++;
+  }
+
+  void _bumpLogsVersion() {
+    logsDataVersion++;
+  }
+
   void markUserActivity() {
-    _lastUserActivity = DateTime.now();
+    final now = DateTime.now();
+    if (now.difference(_lastUserActivity).inSeconds >= 2) {
+      _lastUserActivity = now;
+    }
   }
 
   void setWindowHidden(bool hidden) {
     if (_windowHiddenOrMinimized == hidden) return;
     _windowHiddenOrMinimized = hidden;
     _rescheduleStatusLoop();
-    notifyListeners();
+    _safeNotify();
   }
 
-  Future<void> init() async {
+  /// Фаза 1: быстрая локальная инициализация (настройки + SQLite, ~20 мс) до показа первого кадра UI.
+  Future<void> initLocal() async {
+    if (initialized) return;
     await AppPaths.ensureDirectories();
     settings = await AppSettings.load();
     await db.init();
     scenarios = db.getScenarios();
     scenarioRuns = db.getScenarioRuns();
-    voicePhrases = await voice.listPhrases();
     initialized = true;
+    _refreshUnreadCache();
+  }
+
+  /// Фаза 2: асинхронный запуск сканирования COM-портов, автоподключения и фоновых циклов
+  /// уже после того, как окно отрисовано и полностью отзывчиво.
+  Future<void> startHardwareAndLoops() async {
+    if (_hardwareStarted) return;
+    _hardwareStarted = true;
+
+    voicePhrases = await voice.listPhrases();
+    _safeNotify();
 
     await scanPorts();
+    _startBackgroundLoops();
+
     if (settings.autoConnect && selectedPort != null) {
       await connectPort(selectedPort!, isAuto: true);
     }
-
-    _startBackgroundLoops();
-    notifyListeners();
   }
 
   Future<void> shutdown() async {
+    _disposed = true;
     _usbWatchTimer?.cancel();
     _urcPollTimer?.cancel();
     _statusLoopTimer?.cancel();
     _smsLoopTimer?.cancel();
+    _atNotifyDebounce?.cancel();
     voice.dispose();
     audio.dispose();
     serial.close();
@@ -195,61 +245,89 @@ class ModemController extends ChangeNotifier {
 
   void _emitToast(String msg) {
     lastToastMessage = msg;
-    notifyListeners();
+    _safeNotify();
   }
 
   void clearToast() {
     lastToastMessage = null;
-    notifyListeners();
   }
 
   void _handleAtLog(String dir, String line) {
     final ts = DatabaseService.nowIso().substring(11);
     liveAtLines.insert(0, '[$ts] $dir  $line');
-    if (liveAtLines.length > 350) liveAtLines.removeLast();
-    if (initialized) {
+    if (liveAtLines.length > 300) liveAtLines.removeLast();
+
+    // В SQLite пишем только ошибки и важные события, чтобы фоновый опрос не нагружал диск
+    if (initialized && (dir == 'ERR' || dir == 'WARN' || line.contains('ERROR'))) {
       db.logSystem(dir, line);
+      _bumpLogsVersion();
     }
-    if (!_windowHiddenOrMinimized) {
-      notifyListeners();
+
+    // Коалесцируем обновления UI при потоке AT-строк (не чаще 4 раз/сек)
+    if (!_windowHiddenOrMinimized && _atNotifyDebounce == null) {
+      _atNotifyDebounce = Timer(const Duration(milliseconds: 250), () {
+        _atNotifyDebounce = null;
+        _safeNotify();
+      });
     }
+  }
+
+  Future<String> sendManualAtCommand(String cmd) async {
+    final clean = cmd.trim();
+    if (clean.isEmpty || !serial.isOpen) return '';
+    if (initialized) {
+      db.logSystem('TX', clean);
+    }
+    final res = await modem.exec(clean, timeout: const Duration(seconds: 5));
+    if (initialized && res.trim().isNotEmpty) {
+      db.logSystem('RX', res.trim());
+      _bumpLogsVersion();
+    }
+    _safeNotify();
+    return res;
   }
 
   // ---------------- USB Hotplug & Port Management ----------------
 
   Future<void> scanPorts() async {
-    final found = await Win32SerialPort.scanPorts();
-    ports = found;
-    _knownPortNames = found.map((e) => e.port).toSet();
+    if (_scanningPorts) return;
+    _scanningPorts = true;
+    _safeNotify();
+    try {
+      final found = await Win32SerialPort.scanPorts();
+      ports = found;
+      _knownPortNames = found.map((e) => e.port).toSet();
 
-    // Выбор основного COM-порта с учётом предпочтительного
-    if (settings.preferredPort.isNotEmpty &&
-        found.any((p) => p.port == settings.preferredPort)) {
-      selectedPort = settings.preferredPort;
-    } else if (selectedPort == null ||
-        !found.any((p) => p.port == selectedPort)) {
-      selectedPort = found.isNotEmpty ? found.first.port : null;
-    }
-
-    // Автоподбор звукового COM-порта при первом подключении
-    if (settings.preferredVoicePort.isEmpty) {
-      final voiceCandidate = found
-          .where((p) => p.isHuaweiVoiceCandidate && p.port != selectedPort)
-          .toList();
-      if (voiceCandidate.isNotEmpty) {
-        settings.preferredVoicePort = voiceCandidate.first.port;
-        await settings.save();
+      // Выбор основного COM-порта с учётом предпочтительного
+      if (settings.preferredPort.isNotEmpty &&
+          found.any((p) => p.port == settings.preferredPort)) {
+        selectedPort = settings.preferredPort;
+      } else if (selectedPort == null ||
+          !found.any((p) => p.port == selectedPort)) {
+        selectedPort = found.isNotEmpty ? found.first.port : null;
       }
-    }
 
-    notifyListeners();
+      // Автоподбор звукового COM-порта при первом подключении
+      if (settings.preferredVoicePort.isEmpty) {
+        final voiceCandidate = found
+            .where((p) => p.isHuaweiVoiceCandidate && p.port != selectedPort)
+            .toList();
+        if (voiceCandidate.isNotEmpty) {
+          settings.preferredVoicePort = voiceCandidate.first.port;
+          await settings.save();
+        }
+      }
+    } finally {
+      _scanningPorts = false;
+      _safeNotify();
+    }
   }
 
   Future<void> connectPort(String port, {bool isAuto = false}) async {
-    if (serial.isOpen && serial.portName == port) return;
+    if (busy || (serial.isOpen && serial.portName == port)) return;
     busy = true;
     _manualDisconnected = false;
-    notifyListeners();
+    _safeNotify();
 
     try {
       serial.open(port, baudRate: settings.baudRate);
@@ -267,6 +345,8 @@ class ModemController extends ChangeNotifier {
       _applySnapshotIfChanged(next);
       db.logOperation('Подключение', 'Открыт порт $port', 'OK',
           '${next.model} · ${next.imei} · ${next.simStatus}');
+      db.logSystem('INFO', 'Подключён модем $port (${next.model}, ${next.simStatus})');
+      _bumpLogsVersion();
       _emitToast('Подключено к $port (${next.model})');
 
       if (!next.simMissing) {
@@ -281,10 +361,11 @@ class ModemController extends ChangeNotifier {
       serial.close();
       _applySnapshotIfChanged(const ModemSnapshot());
       db.logSystem('ERR', 'Ошибка подключения к $port: $e');
+      _bumpLogsVersion();
       if (!isAuto) _emitToast('Ошибка подключения: $e');
     } finally {
       busy = false;
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -298,8 +379,9 @@ class ModemController extends ChangeNotifier {
     _applySnapshotIfChanged(const ModemSnapshot());
     if (prevPort != null) {
       db.logOperation('Подключение', 'Закрыт порт $prevPort', 'OK');
+      _bumpLogsVersion();
     }
-    notifyListeners();
+    _safeNotify();
   }
 
   void _handleUnexpectedUsbDisconnect(String reason) {
@@ -309,8 +391,8 @@ class ModemController extends ChangeNotifier {
     _applySnapshotIfChanged(const ModemSnapshot());
     db.logSystem('WARN', 'Мгновенное освобождение порта: $reason');
     db.logOperation('USB Hotplug', 'Модем извлечён', 'Отключён', reason);
+    _bumpLogsVersion();
     _emitToast('Модем извлечён из USB — порт освобождён.');
-    notifyListeners();
   }
 
   void _handleUnsolicitedLine(String line) {
@@ -322,23 +404,24 @@ class ModemController extends ChangeNotifier {
         lastSyncAt: smsDiag.lastSyncAt,
       );
       db.logSystem('INFO', 'Получено уведомление о новой SMS: $line');
+      _bumpLogsVersion();
       if (settings.autoFetchSms && !snapshot.simMissing) {
         unawaited(syncSmsFromModem(silent: false));
       }
-      notifyListeners();
+      _safeNotify();
     } else if (line == 'RING') {
       incomingCallerNumber ??= 'Входящий вызов...';
-      notifyListeners();
+      _safeNotify();
     } else if (line.startsWith('+CLIP:')) {
       final m = RegExp(r'\+CLIP:\s*"([^"]+)"').firstMatch(line);
       if (m != null) {
         incomingCallerNumber = m.group(1);
-        notifyListeners();
+        _safeNotify();
       }
     } else if (line.startsWith('^CEND:')) {
       incomingCallerNumber = null;
       voice.stopVoiceBridge();
-      notifyListeners();
+      _safeNotify();
     }
   }
 
@@ -353,23 +436,25 @@ class ModemController extends ChangeNotifier {
     if (!wasRegistered && next.isRegistered && !next.simMissing) {
       _maybeAutoRunScenarios();
     }
-    notifyListeners();
+    _safeNotify();
   }
 
   // ---------------- Background Adaptive Loops + DIAG ----------------
 
   void _startBackgroundLoops() {
-    // 1. Быстрый перехват URC (+CMTI / RING) и проверка живости дескриптора
+    // 1. Быстрый неблокирующий перехват URC (+CMTI / RING) и проверка дескриптора
     _urcPollTimer?.cancel();
-    _urcPollTimer = Timer.periodic(const Duration(milliseconds: 600), (_) {
-      if (serial.isOpen && !serial.isBusy && !scenarioEngine.isRunning) {
+    _urcPollTimer = Timer.periodic(const Duration(milliseconds: 700), (_) {
+      if (serial.isOpen && !serial.isBusy && !busy && !scenarioEngine.isRunning) {
         serial.pollUnsolicited();
       }
     });
 
-    // 2. USB Hotplug цикл (появление/исчезновение COM-портов)
+    // 2. USB Hotplug цикл через прямой Win32 реестр (<0.1 мс, без запуска reg.exe)
     _usbWatchTimer?.cancel();
     _usbWatchTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+      if (_usbLoopRunning || _disposed) return;
+      _usbLoopRunning = true;
       final sw = Stopwatch()..start();
       try {
         final currentNames = await Win32SerialPort.listQuickPortNames();
@@ -378,7 +463,8 @@ class ModemController extends ChangeNotifier {
             serial.portName != null &&
             !currentNames.contains(serial.portName)) {
           _handleUnexpectedUsbDisconnect(
-              'Порт ${serial.portName} исчез из системы');
+            'Порт ${serial.portName} исчез из системы',
+          );
         }
 
         final changed = currentNames.length != _knownPortNames.length ||
@@ -389,6 +475,7 @@ class ModemController extends ChangeNotifier {
 
           // Автоподключение при возврате/появлении USB-модема
           if (!serial.isOpen &&
+              !busy &&
               !_manualDisconnected &&
               settings.autoConnect &&
               selectedPort != null &&
@@ -399,6 +486,7 @@ class ModemController extends ChangeNotifier {
       } finally {
         sw.stop();
         _usbStats.record(sw.elapsedMilliseconds);
+        _usbLoopRunning = false;
       }
     });
 
@@ -410,7 +498,15 @@ class ModemController extends ChangeNotifier {
     _statusLoopTimer?.cancel();
     final sec = currentStatusIntervalSec;
     _statusLoopTimer = Timer.periodic(Duration(seconds: sec), (_) async {
-      if (!serial.isOpen || serial.isBusy || scenarioEngine.isRunning) return;
+      if (_statusLoopRunning ||
+          _disposed ||
+          busy ||
+          !serial.isOpen ||
+          serial.isBusy ||
+          scenarioEngine.isRunning) {
+        return;
+      }
+      _statusLoopRunning = true;
       final sw = Stopwatch()..start();
       try {
         if (!serial.checkAlive()) return;
@@ -430,10 +526,11 @@ class ModemController extends ChangeNotifier {
         }
       } catch (e) {
         db.logSystem('DIAG', 'Ошибка фонового опроса: $e');
+        _bumpLogsVersion();
       } finally {
         sw.stop();
         _statusStats.record(sw.elapsedMilliseconds);
-        db.logSystem('DIAG', 'StatusLoop ${sw.elapsedMilliseconds}ms (интервал ${sec}с)');
+        _statusLoopRunning = false;
       }
     });
   }
@@ -442,7 +539,10 @@ class ModemController extends ChangeNotifier {
     _smsLoopTimer?.cancel();
     final sec = settings.smsPollIntervalSec.clamp(10, 600).toInt();
     _smsLoopTimer = Timer.periodic(Duration(seconds: sec), (_) async {
-      if (!serial.isOpen ||
+      if (_smsLoopRunning ||
+          _disposed ||
+          busy ||
+          !serial.isOpen ||
           !settings.autoFetchSms ||
           snapshot.simMissing ||
           serial.isBusy ||
@@ -456,7 +556,8 @@ class ModemController extends ChangeNotifier {
   // ---------------- SMS Sync & Sound ----------------
 
   Future<int> syncSmsFromModem({bool silent = false}) async {
-    if (!serial.isOpen || snapshot.simMissing) return 0;
+    if (!serial.isOpen || snapshot.simMissing || _smsLoopRunning) return 0;
+    _smsLoopRunning = true;
     final sw = Stopwatch()..start();
     var addedCount = 0;
     try {
@@ -495,14 +596,18 @@ class ModemController extends ChangeNotifier {
         audio.playSmsNotification(volume: settings.smsSoundVolume);
       }
       if (addedCount > 0) {
+        _refreshUnreadCache();
         db.logOperation('SMS', 'Синхронизация PDU', 'Новых: $addedCount');
-        notifyListeners();
+        _bumpLogsVersion();
+        _safeNotify();
       }
     } catch (e) {
       db.logSystem('ERR', 'Ошибка синхронизации SMS: $e');
+      _bumpLogsVersion();
     } finally {
       sw.stop();
       _smsStats.record(sw.elapsedMilliseconds);
+      _smsLoopRunning = false;
     }
     return addedCount;
   }
@@ -516,7 +621,7 @@ class ModemController extends ChangeNotifier {
       cmtiCount: smsDiag.cmtiCount,
       lastSyncAt: smsDiag.lastSyncAt,
     );
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<bool> sendSmsAndStore(String phone, String body) async {
@@ -538,10 +643,13 @@ class ModemController extends ChangeNotifier {
             ? 'Запрошен отчёт (+CDS)'
             : 'Отправлено',
       );
+      _refreshUnreadCache();
       db.logOperation('SMS', 'Отправка на $phone', 'OK');
-      notifyListeners();
+      _bumpLogsVersion();
+      _safeNotify();
     } else {
       db.logOperation('SMS', 'Отправка на $phone', 'Ошибка');
+      _bumpLogsVersion();
     }
     return ok;
   }
@@ -553,27 +661,31 @@ class ModemController extends ChangeNotifier {
       fetchStaticInfo: true,
     );
     snapshot = next;
-    notifyListeners();
+    _safeNotify();
   }
 
   void markSmsRead(List<int> ids, {bool read = true}) {
     db.markSmsRead(ids, read: read);
-    notifyListeners();
+    _refreshUnreadCache();
+    _safeNotify();
   }
 
   void moveSmsToTrash(List<int> ids) {
     db.moveSmsToTrash(ids);
-    notifyListeners();
+    _refreshUnreadCache();
+    _safeNotify();
   }
 
   void restoreSmsFromTrash(List<int> ids) {
     db.restoreSmsFromTrash(ids);
-    notifyListeners();
+    _refreshUnreadCache();
+    _safeNotify();
   }
 
   void deleteSmsPermanently(List<int> ids) {
     db.deleteSmsPermanently(ids);
-    notifyListeners();
+    _refreshUnreadCache();
+    _safeNotify();
   }
 
   // ---------------- Scenarios Auto-Run & Manual Run ----------------
@@ -608,27 +720,28 @@ class ModemController extends ChangeNotifier {
     ScenarioDefinition scenario,
   ) async {
     scenarioProgressLog.clear();
-    notifyListeners();
+    _safeNotify();
     final res = await scenarioEngine.runScenario(
       scenario: scenario,
       snapshot: snapshot,
       settings: settings,
     );
     scenarioRuns = db.getScenarioRuns();
-    notifyListeners();
+    _bumpLogsVersion();
+    _safeNotify();
     return res;
   }
 
   void saveScenario(ScenarioDefinition sc) {
     db.upsertScenario(sc);
     scenarios = db.getScenarios();
-    notifyListeners();
+    _safeNotify();
   }
 
   void deleteScenario(String id) {
     db.deleteScenario(id);
     scenarios = db.getScenarios();
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<ExcelExportResult> rebuildExcelNow() async {
@@ -643,7 +756,8 @@ class ModemController extends ChangeNotifier {
       res.usedBackup ? 'Резервная копия' : 'OK',
       res.savedPath,
     );
-    notifyListeners();
+    _bumpLogsVersion();
+    _safeNotify();
     return res;
   }
 
@@ -652,18 +766,18 @@ class ModemController extends ChangeNotifier {
   Future<void> refreshActiveCalls() async {
     if (!serial.isOpen) return;
     activeCalls = await modem.listActiveCalls();
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<void> refreshContacts() async {
     if (!serial.isOpen || snapshot.simMissing) return;
     contacts = await modem.readSimContacts();
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<void> refreshVoicePhrases() async {
     voicePhrases = await voice.listPhrases();
-    notifyListeners();
+    _safeNotify();
   }
 
   Future<void> connectRasInternet(String apn) async {
@@ -678,19 +792,21 @@ class ModemController extends ChangeNotifier {
       password: settings.rasPassword,
     );
     db.logOperation('Интернет RAS', 'Подключение ($apn)', rasStatus);
-    notifyListeners();
+    _bumpLogsVersion();
+    _safeNotify();
   }
 
   Future<void> disconnectRasInternet() async {
     rasStatus = await RasDialer.disconnect();
     db.logOperation('Интернет RAS', 'Отключение', rasStatus);
-    notifyListeners();
+    _bumpLogsVersion();
+    _safeNotify();
   }
 
   Future<void> saveSettings() async {
     await settings.save();
     _rescheduleStatusLoop();
     _rescheduleSmsLoop();
-    notifyListeners();
+    _safeNotify();
   }
 }

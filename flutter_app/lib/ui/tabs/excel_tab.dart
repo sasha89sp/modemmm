@@ -222,7 +222,7 @@ class _ExcelTabState extends State<ExcelTab> {
                               ),
                               Expanded(
                                 child: TextFormField(
-                                  key: ValueKey('${col.key}_${col.header}'),
+                                  key: ValueKey('hdr_${col.key}'),
                                   initialValue: col.header,
                                   decoration: InputDecoration(
                                     labelText: col.key,

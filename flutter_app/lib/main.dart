@@ -14,8 +14,8 @@ Future<void> main() async {
     onExitRequested: controller.shutdown,
   );
 
-  await trayService.init();
-  await controller.init();
+  await controller.initLocal();
+  await trayService.initWindow();
 
   runApp(HuaweiE173App(controller: controller, trayService: trayService));
 }

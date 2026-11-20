@@ -16,6 +16,12 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
   String _sysLevelFilter = '';
   String? _csvExportNote;
 
+  List<OperationLogEntry> _cachedOps = const [];
+  int _cachedOpsVersion = -1;
+  List<SystemLogEntry> _cachedSysLogs = const [];
+  int _cachedSysVersion = -1;
+  String _cachedSysFilter = '__init__';
+
   ModemController get c => widget.controller;
 
   @override
@@ -27,13 +33,39 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
   Future<void> _sendAt(String cmd) async {
     final clean = cmd.trim();
     if (clean.isEmpty || !c.snapshot.connected) return;
-    await c.modem.exec(clean, timeout: const Duration(seconds: 5));
-    setState(() {});
+    await c.sendManualAtCommand(clean);
+    if (mounted) setState(() {});
   }
 
   Future<void> _exportCsv() async {
     final path = await c.db.exportOperationsToCsv();
-    setState(() => _csvExportNote = 'Журнал экспортирован в CSV: $path');
+    if (mounted) {
+      setState(() => _csvExportNote = 'Журнал экспортирован в CSV: $path');
+    }
+  }
+
+  List<OperationLogEntry> _getOpsCached({bool force = false}) {
+    if (!c.initialized) return const [];
+    if (force || _cachedOpsVersion != c.logsDataVersion) {
+      _cachedOpsVersion = c.logsDataVersion;
+      _cachedOps = c.db.getOperationLogs(limit: 500);
+    }
+    return _cachedOps;
+  }
+
+  List<SystemLogEntry> _getSysLogsCached({bool force = false}) {
+    if (!c.initialized) return const [];
+    if (force ||
+        _cachedSysVersion != c.logsDataVersion ||
+        _cachedSysFilter != _sysLevelFilter) {
+      _cachedSysVersion = c.logsDataVersion;
+      _cachedSysFilter = _sysLevelFilter;
+      _cachedSysLogs = c.db.getSystemLogs(
+        limit: 500,
+        level: _sysLevelFilter.isEmpty ? null : _sysLevelFilter,
+      );
+    }
+    return _cachedSysLogs;
   }
 
   @override
@@ -170,8 +202,7 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
   }
 
   Widget _buildOperationsTab() {
-    final List<OperationLogEntry> ops =
-        c.initialized ? c.db.getOperationLogs(limit: 500) : const [];
+    final List<OperationLogEntry> ops = _getOpsCached();
 
     return Padding(
       padding: const EdgeInsets.all(14),
@@ -186,7 +217,10 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
               ),
               const Spacer(),
               OutlinedButton.icon(
-                onPressed: () => setState(() {}),
+                onPressed: () {
+                  _getOpsCached(force: true);
+                  setState(() {});
+                },
                 icon: const Icon(Icons.refresh, size: 17),
                 label: const Text('Обновить'),
               ),
@@ -206,41 +240,93 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
             ),
           ],
           const SizedBox(height: 10),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: const BoxDecoration(
+              color: Color(0xFFF1F5F9),
+              border: Border(bottom: BorderSide(color: Color(0xFFCBD5E1))),
+            ),
+            child: const Row(
+              children: [
+                SizedBox(
+                  width: 145,
+                  child: Text('Дата',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                ),
+                SizedBox(
+                  width: 125,
+                  child: Text('Категория',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                ),
+                SizedBox(
+                  width: 210,
+                  child: Text('Действие',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                ),
+                SizedBox(
+                  width: 120,
+                  child: Text('Результат',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                ),
+                Expanded(
+                  child: Text('Детали',
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+                ),
+              ],
+            ),
+          ),
           Expanded(
-            child: SingleChildScrollView(
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: DataTable(
-                  headingRowHeight: 36,
-                  dataRowMinHeight: 34,
-                  dataRowMaxHeight: 54,
-                  columns: const [
-                    DataColumn(label: Text('Дата')),
-                    DataColumn(label: Text('Категория')),
-                    DataColumn(label: Text('Действие')),
-                    DataColumn(label: Text('Результат')),
-                    DataColumn(label: Text('Детали')),
-                  ],
-                  rows: ops
-                      .map((o) => DataRow(cells: [
-                            DataCell(Text(o.createdAt, style: const TextStyle(fontSize: 12))),
-                            DataCell(Text(o.category, style: const TextStyle(fontSize: 12))),
-                            DataCell(Text(o.action, style: const TextStyle(fontSize: 12))),
-                            DataCell(Text(o.result, style: const TextStyle(fontSize: 12))),
-                            DataCell(SizedBox(
-                              width: 340,
+            child: ops.isEmpty
+                ? const Center(child: Text('История операций пока пуста.'))
+                : ListView.separated(
+                    itemCount: ops.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (_, idx) {
+                      final o = ops[idx];
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 6),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            SizedBox(
+                              width: 145,
+                              child: Text(o.createdAt,
+                                  style: const TextStyle(
+                                      fontFamily: 'Consolas',
+                                      fontSize: 11.5,
+                                      color: Colors.black54)),
+                            ),
+                            SizedBox(
+                              width: 125,
+                              child: Text(o.category,
+                                  style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600)),
+                            ),
+                            SizedBox(
+                              width: 210,
+                              child: Text(o.action,
+                                  style: const TextStyle(fontSize: 12)),
+                            ),
+                            SizedBox(
+                              width: 120,
+                              child: Text(o.result,
+                                  style: const TextStyle(fontSize: 12)),
+                            ),
+                            Expanded(
                               child: Text(
                                 o.details,
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(fontSize: 12),
                               ),
-                            )),
-                          ]))
-                      .toList(),
-                ),
-              ),
-            ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
           ),
         ],
       ),
@@ -248,12 +334,7 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
   }
 
   Widget _buildSystemLogTab() {
-    final List<SystemLogEntry> logs = c.initialized
-        ? c.db.getSystemLogs(
-            limit: 500,
-            level: _sysLevelFilter.isEmpty ? null : _sysLevelFilter,
-          )
-        : const [];
+    final List<SystemLogEntry> logs = _getSysLogsCached();
 
     return Padding(
       padding: const EdgeInsets.all(14),
@@ -285,7 +366,10 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
               ),
               const Spacer(),
               OutlinedButton.icon(
-                onPressed: () => setState(() {}),
+                onPressed: () {
+                  _getSysLogsCached(force: true);
+                  setState(() {});
+                },
                 icon: const Icon(Icons.refresh, size: 17),
                 label: const Text('Обновить'),
               ),
@@ -293,6 +377,7 @@ class _TerminalLogsTabState extends State<TerminalLogsTab> {
               OutlinedButton.icon(
                 onPressed: () {
                   c.db.clearSystemLogs();
+                  _getSysLogsCached(force: true);
                   setState(() {});
                 },
                 icon: const Icon(Icons.delete_sweep_outlined, size: 17),

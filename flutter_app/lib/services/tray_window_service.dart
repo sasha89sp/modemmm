@@ -12,7 +12,8 @@ class TrayWindowService with WindowListener, TrayListener {
   final void Function(bool hiddenOrMinimized) onWindowVisibilityChanged;
   final Future<void> Function() onExitRequested;
 
-  bool _initialized = false;
+  bool _windowInitialized = false;
+  bool _trayInitialized = false;
 
   TrayWindowService({
     required this.shouldMinimizeToTray,
@@ -20,24 +21,33 @@ class TrayWindowService with WindowListener, TrayListener {
     required this.onExitRequested,
   });
 
-  Future<void> init() async {
-    if (!Platform.isWindows || _initialized) return;
-    _initialized = true;
+  Future<void> initWindow() async {
+    if (!Platform.isWindows || _windowInitialized) return;
+    _windowInitialized = true;
 
-    await windowManager.ensureInitialized();
-    final options = WindowOptions(
-      size: const Size(1280, 820),
-      minimumSize: const Size(1024, 680),
-      center: true,
-      title: AppVersion.windowTitle,
-    );
-    await windowManager.waitUntilReadyToShow(options, () async {
-      await windowManager.show();
-      await windowManager.focus();
-    });
+    try {
+      await windowManager.ensureInitialized();
+      final options = WindowOptions(
+        size: const Size(1280, 820),
+        minimumSize: const Size(1024, 680),
+        center: true,
+        title: AppVersion.windowTitle,
+      );
+      await windowManager.waitUntilReadyToShow(options, () async {
+        await windowManager.show();
+        await windowManager.focus();
+      });
 
-    await windowManager.setPreventClose(true);
-    windowManager.addListener(this);
+      await windowManager.setPreventClose(true);
+      windowManager.addListener(this);
+    } catch (_) {
+      // Продолжаем работу даже при ошибке плагина окна
+    }
+  }
+
+  Future<void> initTray() async {
+    if (!Platform.isWindows || _trayInitialized) return;
+    _trayInitialized = true;
 
     try {
       final iconPath = AppPaths.trayIconFile;

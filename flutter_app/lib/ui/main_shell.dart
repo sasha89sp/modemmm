@@ -35,6 +35,10 @@ class _MainShellState extends State<MainShell> {
   void initState() {
     super.initState();
     c.addListener(_onControllerUpdate);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.trayService.initTray();
+      c.startHardwareAndLoops();
+    });
   }
 
   @override
@@ -55,13 +59,40 @@ class _MainShellState extends State<MainShell> {
     setState(() {});
   }
 
+  Widget _buildActiveTab() {
+    switch (_tabIndex) {
+      case 0:
+        return DashboardTab(controller: c);
+      case 1:
+        return ScenariosTab(controller: c);
+      case 2:
+        return ExcelTab(controller: c);
+      case 3:
+        return SmsTab(controller: c);
+      case 4:
+        return CallsTab(controller: c);
+      case 5:
+        return UssdTab(controller: c);
+      case 6:
+        return ContactsTab(controller: c);
+      case 7:
+        return TerminalLogsTab(controller: c);
+      case 8:
+        return SettingsTab(
+          controller: c,
+          trayService: widget.trayService,
+        );
+      default:
+        return DashboardTab(controller: c);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final unread = c.unreadSmsCount;
 
     return Listener(
       onPointerDown: (_) => c.markUserActivity(),
-      onPointerMove: (_) => c.markUserActivity(),
       child: Scaffold(
         body: Row(
           children: [
@@ -129,7 +160,11 @@ class _MainShellState extends State<MainShell> {
                         Text(
                           c.snapshot.connected
                               ? '${c.snapshot.port} · ${c.snapshot.simStatus}'
-                              : 'Модем не подключён',
+                              : (c.busy
+                                  ? 'Подключение...'
+                                  : (c.scanningPorts
+                                      ? 'Поиск COM-портов...'
+                                      : 'Модем не подключён')),
                           style: const TextStyle(
                             fontSize: 11,
                             fontWeight: FontWeight.w600,
@@ -159,23 +194,7 @@ class _MainShellState extends State<MainShell> {
                   if (c.incomingCallerNumber != null) _buildIncomingCallBanner(),
                   const Divider(height: 1),
                   Expanded(
-                    child: IndexedStack(
-                      index: _tabIndex,
-                      children: [
-                        DashboardTab(controller: c),
-                        ScenariosTab(controller: c),
-                        ExcelTab(controller: c),
-                        SmsTab(controller: c),
-                        CallsTab(controller: c),
-                        UssdTab(controller: c),
-                        ContactsTab(controller: c),
-                        TerminalLogsTab(controller: c),
-                        SettingsTab(
-                          controller: c,
-                          trayService: widget.trayService,
-                        ),
-                      ],
-                    ),
+                    child: _buildActiveTab(),
                   ),
                   _buildFooter(),
                 ],
@@ -246,13 +265,15 @@ class _MainShellState extends State<MainShell> {
           Expanded(
             child: DropdownButtonFormField<String>(
               value: c.selectedPort,
-              decoration: const InputDecoration(
-                labelText: 'COM-порт Huawei E173',
-                border: OutlineInputBorder(),
+              decoration: InputDecoration(
+                labelText: c.scanningPorts
+                    ? 'Поиск COM-портов Huawei E173...'
+                    : 'COM-порт Huawei E173',
+                border: const OutlineInputBorder(),
                 isDense: true,
               ),
               items: portItems,
-              onChanged: c.snapshot.connected
+              onChanged: c.snapshot.connected || c.busy
                   ? null
                   : (v) => setState(() => c.selectedPort = v),
             ),
@@ -260,8 +281,16 @@ class _MainShellState extends State<MainShell> {
           const SizedBox(width: 10),
           IconButton.outlined(
             tooltip: 'Обновить COM-порты',
-            onPressed: c.snapshot.connected ? null : c.scanPorts,
-            icon: const Icon(Icons.refresh),
+            onPressed: c.snapshot.connected || c.scanningPorts || c.busy
+                ? null
+                : c.scanPorts,
+            icon: c.scanningPorts
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.refresh),
           ),
           const SizedBox(width: 10),
           FilledButton.icon(
@@ -274,8 +303,21 @@ class _MainShellState extends State<MainShell> {
                       c.connectPort(c.selectedPort!);
                     }
                   },
-            icon: Icon(c.snapshot.connected ? Icons.link_off : Icons.usb),
-            label: Text(c.snapshot.connected ? 'Отключить' : 'Подключить'),
+            icon: c.busy
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white,
+                    ),
+                  )
+                : Icon(c.snapshot.connected ? Icons.link_off : Icons.usb),
+            label: Text(
+              c.busy
+                  ? 'Подключение...'
+                  : (c.snapshot.connected ? 'Отключить' : 'Подключить'),
+            ),
           ),
         ],
       ),

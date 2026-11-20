@@ -131,14 +131,146 @@ typedef _CloseHandleDart = int Function(int hObject);
 typedef _GetLastErrorNative = Uint32 Function();
 typedef _GetLastErrorDart = int Function();
 
+// advapi32.dll — прямое чтение реестра HKLM\HARDWARE\DEVICEMAP\SERIALCOMM за <0.1мс без запуска reg.exe
+typedef _RegOpenKeyExWNative = Int32 Function(
+  IntPtr hKey,
+  Pointer<Utf16> lpSubKey,
+  Uint32 ulOptions,
+  Uint32 samDesired,
+  Pointer<IntPtr> phkResult,
+);
+typedef _RegOpenKeyExWDart = int Function(
+  int hKey,
+  Pointer<Utf16> lpSubKey,
+  int ulOptions,
+  int samDesired,
+  Pointer<IntPtr> phkResult,
+);
+
+typedef _RegEnumValueWNative = Int32 Function(
+  IntPtr hKey,
+  Uint32 dwIndex,
+  Pointer<Utf16> lpValueName,
+  Pointer<Uint32> lpcchValueName,
+  Pointer<Uint32> lpReserved,
+  Pointer<Uint32> lpType,
+  Pointer<Uint8> lpData,
+  Pointer<Uint32> lpcbData,
+);
+typedef _RegEnumValueWDart = int Function(
+  int hKey,
+  int dwIndex,
+  Pointer<Utf16> lpValueName,
+  Pointer<Uint32> lpcchValueName,
+  Pointer<Uint32> lpReserved,
+  Pointer<Uint32> lpType,
+  Pointer<Uint8> lpData,
+  Pointer<Uint32> lpcbData,
+);
+
+typedef _RegCloseKeyNative = Int32 Function(IntPtr hKey);
+typedef _RegCloseKeyDart = int Function(int hKey);
+
+class _Win32RegistrySerial {
+  // 64-bit Windows HKEY_LOCAL_MACHINE = (HKEY)(ULONG_PTR)((LONG)0x80000002)
+  static const int _hkeyLocalMachine = -2147483646;
+  static const int _keyRead = 0x20019;
+  static const int _regSz = 1;
+  static const int _errorSuccess = 0;
+
+  static DynamicLibrary? _advapi32;
+  static _RegOpenKeyExWDart? _regOpenKeyExW;
+  static _RegEnumValueWDart? _regEnumValueW;
+  static _RegCloseKeyDart? _regCloseKey;
+
+  static void _ensureLoaded() {
+    if (_advapi32 != null) return;
+    final lib = DynamicLibrary.open('advapi32.dll');
+    _advapi32 = lib;
+    _regOpenKeyExW = lib.lookupFunction<_RegOpenKeyExWNative, _RegOpenKeyExWDart>(
+        'RegOpenKeyExW');
+    _regEnumValueW = lib.lookupFunction<_RegEnumValueWNative, _RegEnumValueWDart>(
+        'RegEnumValueW');
+    _regCloseKey =
+        lib.lookupFunction<_RegCloseKeyNative, _RegCloseKeyDart>('RegCloseKey');
+  }
+
+  /// Мгновенный (<0.1 мс) список активных COM-портов напрямую из реестра Windows без внешних процессов.
+  static Set<String> readSerialCommPorts() {
+    final ports = <String>{};
+    if (!Platform.isWindows) return ports;
+    try {
+      _ensureLoaded();
+      final subKey = r'HARDWARE\DEVICEMAP\SERIALCOMM'.toNativeUtf16();
+      final phKey = calloc<IntPtr>();
+      try {
+        final openRes =
+            _regOpenKeyExW!(_hkeyLocalMachine, subKey, 0, _keyRead, phKey);
+        if (openRes != _errorSuccess) return ports;
+
+        final hKey = phKey.value;
+        final nameBuf = calloc<Uint16>(256).cast<Utf16>();
+        final dataBuf = calloc<Uint8>(514);
+        final nameLen = calloc<Uint32>();
+        final dataLen = calloc<Uint32>();
+        final typePtr = calloc<Uint32>();
+        try {
+          var index = 0;
+          while (index < 256) {
+            nameLen.value = 256;
+            dataLen.value = 512;
+            final res = _regEnumValueW!(
+              hKey,
+              index,
+              nameBuf,
+              nameLen,
+              nullptr,
+              typePtr,
+              dataBuf,
+              dataLen,
+            );
+            if (res != _errorSuccess) break;
+            if (typePtr.value == _regSz && dataLen.value >= 2) {
+              final safeBytes = dataLen.value > 512 ? 512 : dataLen.value;
+              dataBuf[safeBytes] = 0;
+              dataBuf[safeBytes + 1] = 0;
+              final value =
+                  dataBuf.cast<Utf16>().toDartString().trim().toUpperCase();
+              if (RegExp(r'^COM\d+$').hasMatch(value)) {
+                ports.add(value);
+              }
+            }
+            index++;
+          }
+        } finally {
+          calloc.free(nameBuf);
+          calloc.free(dataBuf);
+          calloc.free(nameLen);
+          calloc.free(dataLen);
+          calloc.free(typePtr);
+          _regCloseKey!(hKey);
+        }
+      } finally {
+        calloc.free(subKey);
+        calloc.free(phKey);
+      }
+    } catch (_) {
+      // Безопасный возврат пустого набора при ошибке доступа
+    }
+    return ports;
+  }
+}
+
 /// Нативный драйвер Windows COM-порта через dart:ffi + kernel32.dll.
-/// Поддерживает мгновенное освобождение при извлечении USB и чтение URC (+CMTI, RING, +CUSD).
+/// Полностью неблокирующее чтение (ReadIntervalTimeout = MAXDWORD + проверка cbInQue) —
+/// никогда не замораживает UI-поток Flutter.
 class Win32SerialPort {
   static const int _invalidHandleValue = -1;
   static const int _genericReadWrite = 0xC0000000;
   static const int _openExisting = 3;
   static const int _purgeRxClear = 0x0008;
   static const int _purgeTxClear = 0x0004;
+  static const int _maxDword = 0xFFFFFFFF;
 
   late final DynamicLibrary _kernel32;
   late final _CreateFileWDart _createFileW;
@@ -194,37 +326,37 @@ class Win32SerialPort {
         .lookupFunction<_GetLastErrorNative, _GetLastErrorDart>('GetLastError');
   }
 
-  /// Быстрый список активных COM-портов из реестра Windows (для экономичного мониторинга USB).
+  /// Мгновенный список активных COM-портов напрямую из реестра Windows (без запуска процессов).
   static Future<Set<String>> listQuickPortNames() async {
-    if (!Platform.isWindows) return {};
-    try {
-      final reg = await Process.run(
-        'reg',
-        ['query', r'HKLM\HARDWARE\DEVICEMAP\SERIALCOMM'],
-      );
-      return RegExp(r'COM\d+')
-          .allMatches(reg.stdout.toString())
-          .map((m) => m.group(0)!)
-          .toSet();
-    } catch (_) {
-      return {};
-    }
+    return _Win32RegistrySerial.readSerialCommPorts();
   }
 
-  /// Полное сканирование COM-портов с чтением PnP-метаданных (VID_12D1, PC UI, Modem, Application/Voice).
+  /// Полное сканирование COM-портов с чтением PnP-метаданных (VID_12D1, PC UI, Modem, Voice).
+  /// Всегда имеет жёсткий таймаут PowerShell и мгновенный fallback на реестр Windows.
   static Future<List<ComPortInfo>> scanPorts() async {
     final results = <ComPortInfo>[];
     if (!Platform.isWindows) return results;
+
+    final quickPorts = _Win32RegistrySerial.readSerialCommPorts();
+    if (quickPorts.isEmpty) {
+      return results;
+    }
+
+    final foundPorts = <String>{};
 
     try {
       final proc = await Process.run(
         'powershell',
         [
           '-NoProfile',
+          '-NoLogo',
+          '-NonInteractive',
+          '-WindowStyle',
+          'Hidden',
           '-Command',
           r"Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match '\(COM\d+\)' } | Select-Object Name, DeviceID | ConvertTo-Json -Compress",
         ],
-      );
+      ).timeout(const Duration(seconds: 4));
 
       final out = (proc.stdout as String).trim();
       if (out.isNotEmpty) {
@@ -238,7 +370,10 @@ class Win32SerialPort {
           final deviceId = item['DeviceID']?.toString() ?? '';
           final match = comRegex.firstMatch(name);
           if (match == null) continue;
-          final port = match.group(1)!;
+          final port = match.group(1)!.toUpperCase();
+          if (!quickPorts.contains(port)) continue;
+          foundPorts.add(port);
+
           final lower = name.toLowerCase();
           final isHuawei = deviceId.toUpperCase().contains('VID_12D1') ||
               lower.contains('huawei');
@@ -261,8 +396,12 @@ class Win32SerialPort {
         }
       }
     } catch (_) {
-      final quick = await listQuickPortNames();
-      for (final p in quick) {
+      // Fallback ниже добавит все порты из реестра
+    }
+
+    // Добавляем порты из реестра, которых не вернул WMI/PowerShell (или при таймауте)
+    for (final p in quickPorts) {
+      if (!foundPorts.contains(p)) {
         results.add(ComPortInfo(
           port: p,
           description: 'Последовательный порт $p',
@@ -275,7 +414,9 @@ class Win32SerialPort {
     results.sort((a, b) {
       final diff = b.priorityScore.compareTo(a.priorityScore);
       if (diff != 0) return diff;
-      return a.port.compareTo(b.port);
+      final numA = int.tryParse(a.port.replaceAll(RegExp(r'\D'), '')) ?? 0;
+      final numB = int.tryParse(b.port.replaceAll(RegExp(r'\D'), '')) ?? 0;
+      return numA.compareTo(numB);
     });
     return results;
   }
@@ -283,7 +424,7 @@ class Win32SerialPort {
   void open(
     String port, {
     int baudRate = 115200,
-    int readTimeoutMs = 120,
+    int readTimeoutMs = 0,
   }) {
     close();
     final path = '\\\\.\\${port.trim().toUpperCase()}';
@@ -325,11 +466,13 @@ class Win32SerialPort {
           throw StateError('Ошибка SetCommState: ${_getLastError()}');
         }
 
-        timeouts.ref.readIntervalTimeout = 20;
-        timeouts.ref.readTotalTimeoutMultiplier = 5;
-        timeouts.ref.readTotalTimeoutConstant = readTimeoutMs;
-        timeouts.ref.writeTotalTimeoutMultiplier = 10;
-        timeouts.ref.writeTotalTimeoutConstant = 400;
+        // Неблокирующий режим Win32: ReadFile возвращается мгновенно (0 мс ожидания),
+        // чтобы никогда не замораживать главный поток Flutter UI.
+        timeouts.ref.readIntervalTimeout = _maxDword;
+        timeouts.ref.readTotalTimeoutMultiplier = 0;
+        timeouts.ref.readTotalTimeoutConstant = readTimeoutMs < 0 ? 0 : readTimeoutMs;
+        timeouts.ref.writeTotalTimeoutMultiplier = 0;
+        timeouts.ref.writeTotalTimeoutConstant = 250;
         _setCommTimeouts(_handle, timeouts);
         _purgeComm(_handle, _purgeRxClear | _purgeTxClear);
       } finally {
@@ -371,27 +514,10 @@ class Win32SerialPort {
   /// Вычитывает необработанные входящие байты без блокировки (для перехвата +CMTI, RING и т.д.).
   void pollUnsolicited() {
     if (!isOpen || _busy) return;
-    final errs = calloc<Uint32>();
-    final stat = calloc<COMSTAT>();
-    int queued = 0;
-    try {
-      final ok = _clearCommError(_handle, errs, stat);
-      if (ok == 0) {
-        _handleDisconnect('USB-порт потерян при фоновом чтении');
-        return;
-      }
-      queued = stat.ref.cbInQue;
-    } finally {
-      calloc.free(errs);
-      calloc.free(stat);
-    }
-
-    if (queued > 0) {
-      final data = readAvailable(maxBytes: queued > 4096 ? 4096 : queued);
-      if (data.isNotEmpty) {
-        final text = latin1.decode(data, allowInvalid: true);
-        _dispatchUnsolicitedLines(text);
-      }
+    final data = readAvailable(maxBytes: 4096);
+    if (data.isNotEmpty) {
+      final text = latin1.decode(data, allowInvalid: true);
+      _dispatchUnsolicitedLines(text);
     }
   }
 
@@ -438,12 +564,33 @@ class Win32SerialPort {
     }
   }
 
+  /// Полностью неблокирующее чтение: сначала проверяет cbInQue через ClearCommError,
+  /// и только при наличии байт читает ровно доступное количество.
   Uint8List readAvailable({int maxBytes = 4096}) {
     if (!isOpen) return Uint8List(0);
-    final buf = calloc<Uint8>(maxBytes);
+    final errs = calloc<Uint32>();
+    final stat = calloc<COMSTAT>();
+    int queued = 0;
+    try {
+      final ok = _clearCommError(_handle, errs, stat);
+      if (ok == 0) {
+        final code = _getLastError();
+        _handleDisconnect('Порт отключён при проверке буфера (Win32 код $code)');
+        return Uint8List(0);
+      }
+      queued = stat.ref.cbInQue;
+    } finally {
+      calloc.free(errs);
+      calloc.free(stat);
+    }
+
+    if (queued <= 0) return Uint8List(0);
+
+    final toRead = queued < maxBytes ? queued : maxBytes;
+    final buf = calloc<Uint8>(toRead);
     final readCount = calloc<Uint32>();
     try {
-      final ok = _readFile(_handle, buf, maxBytes, readCount, nullptr);
+      final ok = _readFile(_handle, buf, toRead, readCount, nullptr);
       if (ok == 0) {
         final code = _getLastError();
         if (code == 31 || code == 22 || code == 1167 || code == 5 || code == 6) {
@@ -471,7 +618,7 @@ class Win32SerialPort {
     }
     _busy = true;
     try {
-      // Сохраняем любые ожидающие URC до очистки буфера
+      // Мгновенно вычитываем ожидающие URC до отправки команды (0 мс блокировки)
       final pre = readAvailable(maxBytes: 2048);
       if (pre.isNotEmpty) {
         _dispatchUnsolicitedLines(latin1.decode(pre, allowInvalid: true));
@@ -506,7 +653,7 @@ class Win32SerialPort {
               if (!waitForTokenLineEnd) return text;
               final after = text.substring(idx);
               if (after.contains('\n') || after.contains('\r')) {
-                await Future.delayed(const Duration(milliseconds: 120));
+                await Future.delayed(const Duration(milliseconds: 100));
                 final tail = readAvailable();
                 if (tail.isNotEmpty) {
                   buffer.write(latin1.decode(tail, allowInvalid: true));
@@ -521,7 +668,7 @@ class Win32SerialPort {
             }
           }
         }
-        await Future.delayed(const Duration(milliseconds: 30));
+        await Future.delayed(const Duration(milliseconds: 25));
       }
       return buffer.toString();
     } finally {
@@ -534,23 +681,31 @@ class Win32SerialPort {
     Duration timeout = const Duration(seconds: 10),
   }) async {
     if (!isOpen) throw StateError('Порт не открыт');
-    final bytes = <int>[...utf8.encode(body), 0x1A];
-    writeBytes(Uint8List.fromList(bytes));
-
-    final buffer = StringBuffer();
-    final deadline = DateTime.now().add(timeout);
-    while (DateTime.now().isBefore(deadline)) {
-      if (!isOpen) break;
-      final chunk = readAvailable();
-      if (chunk.isNotEmpty) {
-        buffer.write(latin1.decode(chunk, allowInvalid: true));
-        final text = buffer.toString();
-        if (text.contains('OK') || text.contains('ERROR')) {
-          return text;
-        }
-      }
-      await Future.delayed(const Duration(milliseconds: 45));
+    while (_busy) {
+      await Future.delayed(const Duration(milliseconds: 20));
     }
-    return buffer.toString();
+    _busy = true;
+    try {
+      final bytes = <int>[...utf8.encode(body), 0x1A];
+      writeBytes(Uint8List.fromList(bytes));
+
+      final buffer = StringBuffer();
+      final deadline = DateTime.now().add(timeout);
+      while (DateTime.now().isBefore(deadline)) {
+        if (!isOpen) break;
+        final chunk = readAvailable();
+        if (chunk.isNotEmpty) {
+          buffer.write(latin1.decode(chunk, allowInvalid: true));
+          final text = buffer.toString();
+          if (text.contains('OK') || text.contains('ERROR')) {
+            return text;
+          }
+        }
+        await Future.delayed(const Duration(milliseconds: 35));
+      }
+      return buffer.toString();
+    } finally {
+      _busy = false;
+    }
   }
 }

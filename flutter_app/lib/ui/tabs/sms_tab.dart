@@ -21,6 +21,11 @@ class _SmsTabState extends State<SmsTab> {
   bool _syncing = false;
   bool _sending = false;
 
+  List<SmsRecord> _cachedMessages = const [];
+  int _cachedVersion = -1;
+  String _cachedFolder = '';
+  String _cachedSearch = '';
+
   ModemController get c => widget.controller;
 
   @override
@@ -32,8 +37,17 @@ class _SmsTabState extends State<SmsTab> {
   }
 
   List<SmsRecord> _loadFiltered() {
-    if (!c.initialized) return [];
-    return c.db.getMessages(folder: _folder, search: _searchCtrl.text);
+    if (!c.initialized) return const [];
+    final q = _searchCtrl.text;
+    if (_cachedVersion != c.smsDataVersion ||
+        _cachedFolder != _folder ||
+        _cachedSearch != q) {
+      _cachedVersion = c.smsDataVersion;
+      _cachedFolder = _folder;
+      _cachedSearch = q;
+      _cachedMessages = c.db.getMessages(folder: _folder, search: q);
+    }
+    return _cachedMessages;
   }
 
   void _snack(String msg) {

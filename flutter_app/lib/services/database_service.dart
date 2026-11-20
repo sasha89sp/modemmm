@@ -10,6 +10,7 @@ import 'app_paths.dart';
 /// SMS со всех SIM-карт с папками и «надгробиями», сценарии, прогоны, журналы и экспорт CSV.
 class DatabaseService {
   Database? _db;
+  int _sysLogInsertCount = 0;
 
   Database get db {
     final instance = _db;
@@ -23,6 +24,9 @@ class DatabaseService {
     await AppPaths.ensureDirectories();
     _db = sqlite3.open(AppPaths.databaseFile);
     db.execute('PRAGMA journal_mode = WAL;');
+    db.execute('PRAGMA synchronous = NORMAL;');
+    db.execute('PRAGMA busy_timeout = 3000;');
+    db.execute('PRAGMA temp_store = MEMORY;');
 
     db.execute('''
       CREATE TABLE IF NOT EXISTS messages (
@@ -432,14 +436,22 @@ class DatabaseService {
   }
 
   void logSystem(String level, String message) {
-    db.execute(
-      'INSERT INTO system_logs (created_at, level, message) VALUES (?, ?, ?)',
-      [nowIso(), level, message],
-    );
-    // Ограничиваем таблицу системного лога последними 5000 записями
-    db.execute(
-      'DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 5000)',
-    );
+    if (_db == null) return;
+    try {
+      db.execute(
+        'INSERT INTO system_logs (created_at, level, message) VALUES (?, ?, ?)',
+        [nowIso(), level, message],
+      );
+      _sysLogInsertCount++;
+      if (_sysLogInsertCount >= 200) {
+        _sysLogInsertCount = 0;
+        db.execute(
+          'DELETE FROM system_logs WHERE id <= COALESCE((SELECT id FROM system_logs ORDER BY id DESC LIMIT 1 OFFSET 5000), 0)',
+        );
+      }
+    } catch (_) {
+      // Не допускаем сбоя UI при ошибке записи системного лога
+    }
   }
 
   List<OperationLogEntry> getOperationLogs({int limit = 500}) {

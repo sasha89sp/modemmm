@@ -35,15 +35,25 @@ class HuaweiE173Service {
   }
 
   Future<void> initialize() async {
-    await exec('ATE0');
-    await exec('AT+CMEE=2');
-    await exec('AT+CLIP=1');
-    await exec('AT+CNMI=2,1,0,1,0');
+    var probe = await exec('AT', timeout: const Duration(milliseconds: 1200));
+    if (!probe.contains('OK')) {
+      probe = await exec('AT', timeout: const Duration(milliseconds: 900));
+    }
+    if (!probe.contains('OK')) {
+      throw StateError(
+        'Порт ${serial.portName ?? ''} не отвечает на AT-команды. Выберите порт Huawei PC UI Interface.',
+      );
+    }
+    await exec('ATE0', timeout: const Duration(milliseconds: 1500));
+    await exec('AT+CMEE=2', timeout: const Duration(milliseconds: 1500));
+    await exec('AT+CLIP=1', timeout: const Duration(milliseconds: 1500));
+    await exec('AT+CNMI=2,1,0,1,0', timeout: const Duration(milliseconds: 1500));
   }
 
   /// Быстрая проверка наличия SIM (используется в режиме «SIM не обнаружена» раз в 60 сек).
   Future<bool> checkSimPresent() async {
-    final cpinRaw = await exec('AT+CPIN?');
+    final cpinRaw =
+        await exec('AT+CPIN?', timeout: const Duration(milliseconds: 1800));
     final lower = cpinRaw.toLowerCase();
     if (lower.contains('sim not inserted') ||
         lower.contains('sim failure') ||
@@ -67,16 +77,20 @@ class HuaweiE173Service {
     var cardLockStatus = current.cardLockStatus;
 
     if (fetchStaticInfo || imei == '—') {
-      final ati = await exec('ATI');
+      final ati = await exec('ATI', timeout: const Duration(milliseconds: 1800));
       manufacturer = _extractLineValue(ati, 'Manufacturer:') ?? manufacturer;
       model = _extractLineValue(ati, 'Model:') ?? model;
       revision = _extractLineValue(ati, 'Revision:') ?? revision;
       imei = _extractLineValue(ati, 'IMEI:') ?? imei;
-      final cardlockRaw = await exec('AT^CARDLOCK?');
+      final cardlockRaw = await exec(
+        'AT^CARDLOCK?',
+        timeout: const Duration(milliseconds: 1500),
+      );
       cardLockStatus = _parseCardLock(cardlockRaw);
     }
 
-    final cpinRaw = await exec('AT+CPIN?');
+    final cpinRaw =
+        await exec('AT+CPIN?', timeout: const Duration(milliseconds: 1800));
     final lowerCpin = cpinRaw.toLowerCase();
 
     var simStatus = 'SIM не обнаружена';
@@ -117,16 +131,21 @@ class HuaweiE173Service {
       );
     }
 
-    final imsiRaw =
-        (fetchStaticInfo || current.imsi == '—') ? await exec('AT+CIMI') : '';
+    final imsiRaw = (fetchStaticInfo || current.imsi == '—')
+        ? await exec('AT+CIMI', timeout: const Duration(milliseconds: 1800))
+        : '';
     final imsi = imsiRaw.isNotEmpty
         ? (RegExp(r'\d{14,16}').firstMatch(imsiRaw)?.group(0) ?? current.imsi)
         : current.imsi;
 
-    final csqRaw = await exec('AT+CSQ');
-    final cregRaw = await exec('AT+CREG?');
-    final copsRaw = await exec('AT+COPS?');
-    final sysinfoRaw = await exec('AT^SYSINFO');
+    final csqRaw =
+        await exec('AT+CSQ', timeout: const Duration(milliseconds: 1500));
+    final cregRaw =
+        await exec('AT+CREG?', timeout: const Duration(milliseconds: 1500));
+    final copsRaw =
+        await exec('AT+COPS?', timeout: const Duration(milliseconds: 1800));
+    final sysinfoRaw =
+        await exec('AT^SYSINFO', timeout: const Duration(milliseconds: 1500));
 
     int rssi = 99;
     final csqMatch = RegExp(r'\+CSQ:\s*(\d+),').firstMatch(csqRaw);
