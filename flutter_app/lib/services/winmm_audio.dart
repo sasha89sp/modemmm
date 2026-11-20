@@ -436,14 +436,14 @@ class WinmmAudio {
     }
 
     // Конвертация в моно 16-бит и линейный ресэмплинг к 8000 Гц
-    final bytesPerSample = math.max(1, bitsPerSample ~/ 8);
-    final frameBytes = bytesPerSample * math.max(1, channels);
-    final totalFrames = dataLength ~/ frameBytes;
+    final int bytesPerSample = math.max<int>(1, bitsPerSample ~/ 8);
+    final int frameBytes = bytesPerSample * math.max<int>(1, channels);
+    final int totalFrames = dataLength ~/ frameBytes;
     if (totalFrames <= 0 || sampleRate <= 0) return Uint8List(0);
 
     final monoSamples = Int16List(totalFrames);
     for (var i = 0; i < totalFrames; i++) {
-      final base = dataOffset + i * frameBytes;
+      final int base = dataOffset + i * frameBytes;
       int sample;
       if (bitsPerSample == 16 && base + 1 < wavBytes.length) {
         sample = bd.getInt16(base, Endian.little);
