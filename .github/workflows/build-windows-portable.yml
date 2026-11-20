@@ -1,0 +1,80 @@
+name: Build Portable Windows (Huawei E173)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: huawei_e173_manager
+  APP_DIR: flutter_app
+
+jobs:
+  build-windows-portable:
+    runs-on: windows-latest
+
+    steps:
+      - name: Загрузить исходный код
+        uses: actions/checkout@v4
+
+      - name: Установить Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Подготовить Windows Runner
+        working-directory: ${{ env.APP_DIR }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "windows")) {
+            Copy-Item "pubspec.yaml" "pubspec.yaml.bak"
+            Copy-Item "lib/main.dart" "main.dart.bak"
+            flutter create --platforms=windows --project-name ${{ env.APP_NAME }} .
+            Move-Item -Force "pubspec.yaml.bak" "pubspec.yaml"
+            Move-Item -Force "main.dart.bak" "lib/main.dart"
+            if (Test-Path "test/widget_test.dart") { Remove-Item -Force "test/widget_test.dart" }
+          }
+          if (Test-Path "windows/runner/main.cpp") {
+            $cpp = Get-Content "windows/runner/main.cpp" -Raw
+            $cpp = $cpp -replace 'window\.Create\(L"[^"]*"', 'window.Create(L"Huawei E173 Portable Manager"'
+            Set-Content -Path "windows/runner/main.cpp" -Value $cpp -NoNewline
+          }
+
+      - name: Установить зависимости Flutter
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+
+      - name: Собрать Windows x64 Release
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter build windows --release
+
+      - name: Упаковать портативную сборку в ZIP
+        working-directory: ${{ env.APP_DIR }}
+        shell: pwsh
+        run: |
+          $outDir = "dist/${{ env.APP_NAME }}-portable-win64"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          Copy-Item -Recurse -Force "build/windows/x64/runner/Release/*" $outDir
+          "PORTABLE_MODE=1" | Set-Content -Path "$outDir/portable.flag" -Encoding UTF8
+          @('@echo off', 'cd /d "%~dp0"', 'start "" "huawei_e173_manager.exe"') | Set-Content -Path "$outDir/Start_Portable.bat" -Encoding ASCII
+          $archive = "${{ env.APP_NAME }}-portable-win64.zip"
+          Compress-Archive -Path "$outDir/*" -DestinationPath $archive -Force
+
+      - name: Загрузить портативный ZIP в Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: huawei_e173_manager-portable-win64
+          path: flutter_app/huawei_e173_manager-portable-win64.zip
+          retention-days: 30
+
+      - name: Создать GitHub Release при пуше тега v*
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: flutter_app/huawei_e173_manager-portable-win64.zip
+          generate_release_notes: true

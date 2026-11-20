@@ -1,0 +1,8 @@
+{
+  "name": "Huawei E173 Flutter Windows Builder",
+  "description": "Генератор портативной Windows-программы на Flutter для работы с USB-модемом Huawei E173 с готовой сборкой через GitHub Actions и интерактивным симулятором AT-команд.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
