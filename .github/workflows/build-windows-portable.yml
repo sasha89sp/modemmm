@@ -103,7 +103,18 @@ jobs:
 
       - name: Проверить код (flutter analyze)
         working-directory: ${{ env.APP_DIR }}
-        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+        shell: pwsh
+        run: |
+          $out = flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1
+          $code = $LASTEXITCODE
+          $errs = $out | Select-String "error -"
+          if ($errs) {
+            Write-Host "=== DART ERRORS ===" -ForegroundColor Red
+            $errs | ForEach-Object { Write-Host $_.Line }
+          } else {
+            Write-Host "Dart analyze passed with 0 errors." -ForegroundColor Green
+          }
+          exit $code
 
       - name: Собрать Windows x64 Release
         working-directory: ${{ env.APP_DIR }}

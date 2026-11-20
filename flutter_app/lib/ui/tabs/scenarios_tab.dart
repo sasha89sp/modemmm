@@ -83,8 +83,7 @@ class _ScenariosTabState extends State<ScenariosTab> {
   }
 
   Future<void> _openStepEditor({ScenarioStep? existing, int? replaceIndex}) async {
-    final d = _draft;
-    if (d == null) return;
+    if (_draft == null) return;
 
     var type = existing?.type ?? ScenarioStepType.checkBalanceUssd;
     final titleCtrl = TextEditingController(text: existing?.title ?? '');

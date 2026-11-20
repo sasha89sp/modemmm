@@ -198,7 +198,9 @@ class AppSettings {
             raw['requestSmsDeliveryReport'] as bool? ?? false,
         smsSoundEnabled: raw['smsSoundEnabled'] as bool? ?? true,
         smsSoundVolume:
-            ((raw['smsSoundVolume'] as num?)?.toDouble() ?? 0.8).clamp(0.0, 1.0),
+            ((raw['smsSoundVolume'] as num?)?.toDouble() ?? 0.8)
+                .clamp(0.0, 1.0)
+                .toDouble(),
         minimizeToTrayOnClose: raw['minimizeToTrayOnClose'] as bool? ?? true,
         activePollSec: (raw['activePollSec'] as num?)?.toInt() ?? 6,
         idlePollSec: (raw['idlePollSec'] as num?)?.toInt() ?? 20,

@@ -440,7 +440,7 @@ class ModemController extends ChangeNotifier {
 
   void _rescheduleSmsLoop() {
     _smsLoopTimer?.cancel();
-    final sec = settings.smsPollIntervalSec.clamp(10, 600);
+    final sec = settings.smsPollIntervalSec.clamp(10, 600).toInt();
     _smsLoopTimer = Timer.periodic(Duration(seconds: sec), (_) async {
       if (!serial.isOpen ||
           !settings.autoFetchSms ||

@@ -134,8 +134,9 @@ class HuaweiE173Service {
       rssi = int.tryParse(csqMatch.group(1)!) ?? 99;
     }
     final dbm = (rssi >= 0 && rssi <= 31) ? (-113 + rssi * 2) : null;
-    final signalPercent =
-        (rssi >= 0 && rssi <= 31) ? ((rssi / 31.0) * 100).round().clamp(0, 100) : 0;
+    final signalPercent = (rssi >= 0 && rssi <= 31)
+        ? ((rssi / 31.0) * 100).round().clamp(0, 100).toInt()
+        : 0;
 
     final regParsed = _parseCreg(cregRaw);
     var operatorName = 'Поиск сети...';

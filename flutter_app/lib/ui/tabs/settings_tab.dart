@@ -50,13 +50,13 @@ class _SettingsTabState extends State<SettingsTab> {
 
   Future<void> _saveAll() async {
     c.settings.smsPollIntervalSec =
-        (int.tryParse(_smsIntervalCtrl.text) ?? 25).clamp(10, 600);
+        (int.tryParse(_smsIntervalCtrl.text) ?? 25).clamp(10, 600).toInt();
     c.settings.activePollSec =
-        (int.tryParse(_activePollCtrl.text) ?? 6).clamp(3, 120);
+        (int.tryParse(_activePollCtrl.text) ?? 6).clamp(3, 120).toInt();
     c.settings.idlePollSec =
-        (int.tryParse(_idlePollCtrl.text) ?? 20).clamp(5, 300);
+        (int.tryParse(_idlePollCtrl.text) ?? 20).clamp(5, 300).toInt();
     c.settings.hiddenPollSec =
-        (int.tryParse(_hiddenPollCtrl.text) ?? 45).clamp(10, 600);
+        (int.tryParse(_hiddenPollCtrl.text) ?? 45).clamp(10, 600).toInt();
     await c.saveSettings();
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(

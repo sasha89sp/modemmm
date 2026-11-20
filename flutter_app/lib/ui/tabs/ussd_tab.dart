@@ -62,8 +62,8 @@ class _UssdTabState extends State<UssdTab> {
         .toList();
     if (selected.isEmpty) return;
 
-    final pauseSec = (int.tryParse(_pauseSecCtrl.text) ?? 3).clamp(0, 120);
-    final repeats = (int.tryParse(_repeatsCtrl.text) ?? 1).clamp(1, 50);
+    final pauseSec = (int.tryParse(_pauseSecCtrl.text) ?? 3).clamp(0, 120).toInt();
+    final repeats = (int.tryParse(_repeatsCtrl.text) ?? 1).clamp(1, 50).toInt();
 
     setState(() {
       _batchRunning = true;

@@ -202,7 +202,7 @@ class WinmmAudio {
   /// Воспроизводит приятную двухтональную мелодию оповещения SMS через winmm.dll.
   void playSmsNotification({double volume = 0.8}) {
     if (!Platform.isWindows || volume <= 0.01) return;
-    final wav = _synthesizeSmsChimeWav(volume.clamp(0.0, 1.0));
+    final wav = _synthesizeSmsChimeWav(volume.clamp(0.0, 1.0).toDouble());
     if (_lastChimeBuf != null) {
       calloc.free(_lastChimeBuf!);
       _lastChimeBuf = null;
@@ -457,7 +457,7 @@ class WinmmAudio {
     final out = ByteData(targetFrames * 2);
     for (var i = 0; i < targetFrames; i++) {
       final srcIdx =
-          (i * sampleRate / 8000).floor().clamp(0, monoSamples.length - 1);
+          (i * sampleRate / 8000).floor().clamp(0, monoSamples.length - 1).toInt();
       out.setInt16(i * 2, monoSamples[srcIdx], Endian.little);
     }
     return out.buffer.asUint8List();
@@ -476,7 +476,7 @@ class WinmmAudio {
       final localT = t < 0.16 ? t : (t - 0.16);
       final env = math.exp(-localT * 9.0);
       final s = (math.sin(2 * math.pi * freq * t) * amp * env).round();
-      pcm.setInt16(i * 2, s.clamp(-32767, 32767), Endian.little);
+      pcm.setInt16(i * 2, s.clamp(-32767, 32767).toInt(), Endian.little);
     }
 
     final pcmBytes = pcm.buffer.asUint8List();
