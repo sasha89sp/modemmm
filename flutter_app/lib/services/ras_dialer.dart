@@ -1,18 +1,15 @@
 import 'dart:io';
-import 'portable_config.dart';
+import 'app_paths.dart';
 
-/// Управление Dial-Up соединением Windows через встроенную утилиту rasdial.exe
-/// с портативной телефонной книгой huawei_e173.pbk рядом с .exe.
+/// Управление Dial-Up соединением Windows через rasdial.exe
+/// с портативной книгой UserData/huawei_e173.pbk.
 class RasDialer {
   static const String entryName = 'Huawei_E173_Portable';
 
-  static File get phonebookFile => File(
-        '${PortableConfig.baseDirectory}${Platform.pathSeparator}huawei_e173.pbk',
-      );
+  static File get phonebookFile => File(AppPaths.phonebookFile);
 
-  static Future<void> ensurePhonebook({
-    required String dialNumber,
-  }) async {
+  static Future<void> ensurePhonebook({required String dialNumber}) async {
+    await AppPaths.ensureDirectories();
     final content = '''[$entryName]
 Encoding=1
 Type=1

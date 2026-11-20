@@ -1,8 +1,11 @@
 import '../models/modem_models.dart';
+import 'pdu_codec.dart';
 import 'ucs2_codec.dart';
 import 'win32_serial.dart';
 
-/// Сервис протокола AT-команд для модема Huawei E173 (3G HSPA).
+/// Полный AT-сервис Huawei E173:
+/// статус/SIM/регистрация, PDU SMS + отчёт о доставке + диагностика, USSD DCS 15/72,
+/// голосовые вызовы (ATD/ATA/ATH/DTMF/CLCC/DDSETEX), контакты SIM (CPBR/CPBW), SYSCFG/U2DIAG.
 class HuaweiE173Service {
   final Win32SerialPort serial;
   final void Function(String direction, String line)? onLog;
@@ -13,12 +16,14 @@ class HuaweiE173Service {
     String cmd, {
     Duration timeout = const Duration(seconds: 3),
     String? expectToken,
+    bool waitForTokenLineEnd = false,
   }) async {
     onLog?.call('TX', cmd);
     final response = await serial.sendCommand(
       cmd,
       timeout: timeout,
       expectToken: expectToken,
+      waitForTokenLineEnd: waitForTokenLineEnd,
     );
     for (final line in response.split(RegExp(r'[\r\n]+'))) {
       final clean = line.trim();
@@ -32,31 +37,96 @@ class HuaweiE173Service {
   Future<void> initialize() async {
     await exec('ATE0');
     await exec('AT+CMEE=2');
+    await exec('AT+CLIP=1');
+    await exec('AT+CNMI=2,1,0,1,0');
   }
 
-  Future<ModemInfo> refreshAll() async {
-    final ati = await exec('ATI');
-    final imsiRaw = await exec('AT+CIMI');
+  /// Быстрая проверка наличия SIM (используется в режиме «SIM не обнаружена» раз в 60 сек).
+  Future<bool> checkSimPresent() async {
     final cpinRaw = await exec('AT+CPIN?');
-    final csqRaw = await exec('AT+CSQ');
-    final copsRaw = await exec('AT+COPS?');
-    final sysinfoRaw = await exec('AT^SYSINFO');
-    final cardlockRaw = await exec('AT^CARDLOCK?');
+    final lower = cpinRaw.toLowerCase();
+    if (lower.contains('sim not inserted') ||
+        lower.contains('sim failure') ||
+        lower.contains('+cme error: 10') ||
+        lower.contains('+cme error: 13')) {
+      return false;
+    }
+    return cpinRaw.contains('READY') ||
+        cpinRaw.contains('SIM PIN') ||
+        cpinRaw.contains('SIM PUK');
+  }
 
-    final manufacturer = _extractLineValue(ati, 'Manufacturer:') ?? 'Huawei';
-    final model = _extractLineValue(ati, 'Model:') ?? 'E173';
-    final revision = _extractLineValue(ati, 'Revision:') ?? '—';
-    final imei = _extractLineValue(ati, 'IMEI:') ?? '—';
-    final imsi = RegExp(r'\d{14,16}').firstMatch(imsiRaw)?.group(0) ?? '—';
+  Future<ModemSnapshot> pollSnapshot({
+    required ModemSnapshot current,
+    bool fetchStaticInfo = false,
+  }) async {
+    var manufacturer = current.manufacturer;
+    var model = current.model;
+    var revision = current.revision;
+    var imei = current.imei;
+    var cardLockStatus = current.cardLockStatus;
 
-    var simStatus = 'Нет SIM';
+    if (fetchStaticInfo || imei == '—') {
+      final ati = await exec('ATI');
+      manufacturer = _extractLineValue(ati, 'Manufacturer:') ?? manufacturer;
+      model = _extractLineValue(ati, 'Model:') ?? model;
+      revision = _extractLineValue(ati, 'Revision:') ?? revision;
+      imei = _extractLineValue(ati, 'IMEI:') ?? imei;
+      final cardlockRaw = await exec('AT^CARDLOCK?');
+      cardLockStatus = _parseCardLock(cardlockRaw);
+    }
+
+    final cpinRaw = await exec('AT+CPIN?');
+    final lowerCpin = cpinRaw.toLowerCase();
+
+    var simStatus = 'SIM не обнаружена';
+    var simMissing = false;
     if (cpinRaw.contains('READY')) {
       simStatus = 'SIM готова';
     } else if (cpinRaw.contains('SIM PIN')) {
       simStatus = 'Требуется PIN';
     } else if (cpinRaw.contains('SIM PUK')) {
       simStatus = 'Требуется PUK';
+    } else if (lowerCpin.contains('not inserted') ||
+        lowerCpin.contains('error') ||
+        cpinRaw.trim().isEmpty) {
+      simStatus = 'SIM не обнаружена';
+      simMissing = true;
     }
+
+    // При отсутствии SIM отключаем запросы к SIM/сети
+    if (simMissing) {
+      return ModemSnapshot(
+        connected: serial.isOpen,
+        port: serial.portName ?? '',
+        manufacturer: manufacturer,
+        model: model,
+        revision: revision,
+        imei: imei,
+        imsi: '—',
+        simStatus: simStatus,
+        simMissing: true,
+        operatorName: 'Нет SIM',
+        regStatus: 'SIM не обнаружена',
+        isRegistered: false,
+        rssi: 99,
+        dbm: null,
+        signalPercent: 0,
+        networkType: 'Нет сети',
+        cardLockStatus: cardLockStatus,
+      );
+    }
+
+    final imsiRaw =
+        (fetchStaticInfo || current.imsi == '—') ? await exec('AT+CIMI') : '';
+    final imsi = imsiRaw.isNotEmpty
+        ? (RegExp(r'\d{14,16}').firstMatch(imsiRaw)?.group(0) ?? current.imsi)
+        : current.imsi;
+
+    final csqRaw = await exec('AT+CSQ');
+    final cregRaw = await exec('AT+CREG?');
+    final copsRaw = await exec('AT+COPS?');
+    final sysinfoRaw = await exec('AT^SYSINFO');
 
     int rssi = 99;
     final csqMatch = RegExp(r'\+CSQ:\s*(\d+),').firstMatch(csqRaw);
@@ -64,68 +134,80 @@ class HuaweiE173Service {
       rssi = int.tryParse(csqMatch.group(1)!) ?? 99;
     }
     final dbm = (rssi >= 0 && rssi <= 31) ? (-113 + rssi * 2) : null;
+    final signalPercent =
+        (rssi >= 0 && rssi <= 31) ? ((rssi / 31.0) * 100).round().clamp(0, 100) : 0;
 
-    var operatorName = 'Не зарегистрирован';
+    final regParsed = _parseCreg(cregRaw);
+    var operatorName = 'Поиск сети...';
     final copsMatch =
         RegExp(r'\+COPS:\s*\d+,\d+,"([^"]+)"').firstMatch(copsRaw);
     if (copsMatch != null) {
       operatorName = Ucs2Codec.decodeSmart(copsMatch.group(1)!);
+    } else if (!regParsed.$2) {
+      operatorName = 'Нет регистрации';
     }
 
     final networkType = _parseSysInfo(sysinfoRaw);
-    final cardLockStatus = _parseCardLock(cardlockRaw);
 
-    return ModemInfo(
+    return ModemSnapshot(
+      connected: serial.isOpen,
+      port: serial.portName ?? '',
       manufacturer: manufacturer,
       model: model,
       revision: revision,
       imei: imei,
       imsi: imsi,
       simStatus: simStatus,
+      simMissing: false,
       operatorName: operatorName,
+      regStatus: regParsed.$1,
+      isRegistered: regParsed.$2,
       rssi: rssi,
       dbm: dbm,
+      signalPercent: signalPercent,
       networkType: networkType,
       cardLockStatus: cardLockStatus,
     );
   }
 
-  Future<List<SmsMessageItem>> readAllSms() async {
-    await exec('AT+CMGF=1');
-    await exec('AT+CSCS="UCS2"');
-    final raw =
-        await exec('AT+CMGL="ALL"', timeout: const Duration(seconds: 6));
+  // ---------------- SMS (PDU + Multipart + Diagnostics) ----------------
+
+  Future<List<AssembledSms>> readAllSmsPdu() async {
+    await exec('AT+CMGF=0');
+    final raw = await exec('AT+CMGL=4', timeout: const Duration(seconds: 8));
     final lines = raw.split(RegExp(r'\r?\n'));
-    final items = <SmsMessageItem>[];
+    final parts = <DecodedPduSms>[];
 
-    final headerRe = RegExp(
-      r'^\+CMGL:\s*(\d+),"([^"]*)","([^"]*)",[^,]*,"([^"]*)"',
-    );
-
+    final headerRe = RegExp(r'^\+CMGL:\s*(\d+),(\d+),');
     for (var i = 0; i < lines.length; i++) {
       final m = headerRe.firstMatch(lines[i].trim());
-      if (m != null) {
-        final index = int.tryParse(m.group(1)!) ?? 0;
-        final status = Ucs2Codec.decodeSmart(m.group(2)!);
-        final sender = Ucs2Codec.decodeSmart(m.group(3)!);
-        final time = m.group(4)!;
-        final bodyLine = (i + 1 < lines.length) ? lines[i + 1].trim() : '';
-        items.add(SmsMessageItem(
-          index: index,
-          status: status,
-          sender: sender,
-          timestamp: time,
-          body: Ucs2Codec.decodeSmart(bodyLine),
-        ));
+      if (m != null && i + 1 < lines.length) {
+        final idx = int.tryParse(m.group(1)!) ?? 0;
+        final stat = int.tryParse(m.group(2)!) ?? 0;
+        final pduLine = lines[i + 1].trim();
+        final decoded = PduCodec.decodePdu(
+          modemIndex: idx,
+          stat: stat,
+          pduHex: pduLine,
+        );
+        if (decoded != null) {
+          parts.add(decoded);
+        }
       }
     }
-    return items.reversed.toList();
+    return PduCodec.assembleParts(parts);
   }
 
-  Future<bool> sendSms(String phone, String message) async {
+  Future<bool> sendSms({
+    required String phone,
+    required String message,
+    bool requestDeliveryReport = false,
+  }) async {
     await exec('AT+CMGF=1');
     await exec('AT+CSCS="UCS2"');
-    await exec('AT+CSMP=17,167,0,8');
+    // FO=49 включает Status Report Request (SRR), FO=17 — без отчёта о доставке
+    final fo = requestDeliveryReport ? 49 : 17;
+    await exec('AT+CSMP=$fo,167,0,8');
 
     final hexPhone = Ucs2Codec.encodeHex(phone.trim());
     final hexBody = Ucs2Codec.encodeHex(message);
@@ -135,36 +217,216 @@ class HuaweiE173Service {
       timeout: const Duration(seconds: 4),
       expectToken: '>',
     );
-    if (!prompt.contains('>')) {
-      return false;
-    }
+    if (!prompt.contains('>')) return false;
+
     onLog?.call('TX', '<UCS2 SMS Payload + Ctrl+Z>');
     final result = await serial.sendRawWithCtrlZ(hexBody);
     onLog?.call('RX', result.trim());
     return result.contains('OK') || result.contains('+CMGS:');
   }
 
-  Future<bool> deleteSms(int index) async {
+  Future<bool> deleteSmsFromModem(int index) async {
     final res = await exec('AT+CMGD=$index');
     return res.contains('OK');
   }
 
-  Future<String> sendUssd(String code) async {
-    await exec('AT+CSCS="UCS2"');
-    final encoded = Ucs2Codec.encodeHex(code.trim());
-    final res = await exec(
-      'AT+CUSD=1,"$encoded",15',
-      timeout: const Duration(seconds: 10),
-      expectToken: '+CUSD:',
-    );
-    final match = RegExp(r'\+CUSD:\s*\d+,"([^"]+)"').firstMatch(res);
-    if (match != null) {
-      return Ucs2Codec.decodeSmart(match.group(1)!);
-    }
-    return res.trim().isEmpty
-        ? 'Нет ответа от сети (проверьте порт PC UI Interface).'
-        : res.trim();
+  Future<(String cnmi, String cpms)> querySmsDiagnostics() async {
+    final cnmi = await exec('AT+CNMI?');
+    final cpms = await exec('AT+CPMS?');
+    final cnmiLine = RegExp(r'\+CNMI:[^\r\n]+').firstMatch(cnmi)?.group(0) ??
+        cnmi.trim();
+    final cpmsLine = RegExp(r'\+CPMS:[^\r\n]+').firstMatch(cpms)?.group(0) ??
+        cpms.trim();
+    return (cnmiLine, cpmsLine);
   }
+
+  // ---------------- USSD (DCS 15 / 72 + Session Management) ----------------
+
+  Future<void> cancelUssdSession() async {
+    await exec('AT+CUSD=2', timeout: const Duration(seconds: 2));
+  }
+
+  /// Отправка USSD с выбором DCS (15 = GSM 7-bit PDU / текст, 72 = UCS2).
+  Future<String> sendUssd(
+    String code, {
+    int dcs = 15,
+    bool autoFallback = true,
+  }) async {
+    final cleanCode = code.trim();
+    if (cleanCode.isEmpty) return 'Введите USSD-команду.';
+
+    if (cleanCode.startsWith('*') || cleanCode.startsWith('#')) {
+      await exec('AT+CUSD=2', timeout: const Duration(seconds: 1));
+    }
+
+    String raw = '';
+    if (dcs == 72) {
+      await exec('AT+CSCS="UCS2"', timeout: const Duration(seconds: 1));
+      final encoded = Ucs2Codec.encodeHex(cleanCode);
+      raw = await exec(
+        'AT+CUSD=1,"$encoded",72',
+        timeout: const Duration(seconds: 15),
+        expectToken: '+CUSD:',
+        waitForTokenLineEnd: true,
+      );
+    } else {
+      await exec('AT+CSCS="GSM"', timeout: const Duration(seconds: 1));
+      final pdu = Ucs2Codec.encodeGsm7PackedHex(cleanCode);
+      raw = await exec(
+        'AT+CUSD=1,"$pdu",15',
+        timeout: const Duration(seconds: 15),
+        expectToken: '+CUSD:',
+        waitForTokenLineEnd: true,
+      );
+
+      if (autoFallback &&
+          !raw.contains('+CUSD:') &&
+          !raw.toLowerCase().contains('no network service') &&
+          (raw.contains('ERROR') || raw.trim().isEmpty)) {
+        raw = await exec(
+          'AT+CUSD=1,"$cleanCode",15',
+          timeout: const Duration(seconds: 15),
+          expectToken: '+CUSD:',
+          waitForTokenLineEnd: true,
+        );
+      }
+    }
+
+    final cusdMatch =
+        RegExp(r'\+CUSD:\s*(\d+),"([^"]*)"(?:,\s*(\d+))?', dotAll: true)
+            .firstMatch(raw);
+    if (cusdMatch != null) {
+      final status = cusdMatch.group(1) ?? '0';
+      final payload = cusdMatch.group(2) ?? '';
+      final respDcs = int.tryParse(cusdMatch.group(3) ?? '');
+      final decoded = Ucs2Codec.decodeUssdPayload(payload, respDcs);
+      if (status == '1') {
+        return '$decoded\n\n[Сессия открыта — можно отправить пункт меню или закрыть AT+CUSD=2]';
+      }
+      return decoded.isNotEmpty
+          ? decoded
+          : 'Пустой ответ от оператора (+CUSD: $status).';
+    }
+
+    if (raw.toLowerCase().contains('no network service') ||
+        raw.contains('+CME ERROR: 30')) {
+      final creg = await exec('AT+CREG?');
+      final sys = await exec('AT^SYSINFO');
+      final csq = await exec('AT+CSQ');
+      return '+CME ERROR: no network service (нет регистрации в голосовой сети CS).\n'
+          'Переключите модем в 2G GSM или Авто 2G/3G (CS+PS).\n'
+          'Диагностика: ${creg.trim()} | ${csq.trim()} | ${sys.trim()}';
+    }
+
+    return raw.trim().isEmpty
+        ? 'Таймаут ожидания +CUSD (15 сек).'
+        : raw.trim();
+  }
+
+  Future<void> enableNetworkForUssd({bool only2g = false}) async {
+    await exec('AT+CFUN=1');
+    if (only2g) {
+      await exec('AT^SYSCFG=13,1,3FFFFFFF,1,2');
+    } else {
+      await exec('AT^SYSCFG=2,0,3FFFFFFF,1,2');
+    }
+    await exec('AT+COPS=0', timeout: const Duration(seconds: 6));
+  }
+
+  // ---------------- Voice Calls & DTMF ----------------
+
+  Future<bool> dialVoice(String number) async {
+    final clean = number.trim();
+    if (clean.isEmpty) return false;
+    final res = await exec('ATD$clean;', timeout: const Duration(seconds: 5));
+    await exec('AT^DDSETEX=2'); // Открываем аудиопоток на голосовой COM-порт Huawei E173
+    return res.contains('OK');
+  }
+
+  Future<bool> answerCall() async {
+    final res = await exec('ATA', timeout: const Duration(seconds: 4));
+    await exec('AT^DDSETEX=2');
+    return res.contains('OK');
+  }
+
+  Future<bool> hangupCall() async {
+    final res = await exec('AT+CHUP');
+    if (!res.contains('OK')) {
+      final res2 = await exec('ATH');
+      return res2.contains('OK');
+    }
+    return true;
+  }
+
+  Future<void> enableHuaweiVoiceChannel() async {
+    await exec('AT^DDSETEX=2');
+  }
+
+  Future<bool> sendDtmf(String digits) async {
+    final clean = digits.replaceAll(RegExp(r'[^0-9A-Da-d\*#]'), '');
+    if (clean.isEmpty) return false;
+    for (var i = 0; i < clean.length; i++) {
+      final ch = clean[i];
+      await exec('AT+VTS="$ch"');
+      await Future.delayed(const Duration(milliseconds: 220));
+    }
+    return true;
+  }
+
+  Future<List<ActiveCallInfo>> listActiveCalls() async {
+    final raw = await exec('AT+CLCC');
+    final list = <ActiveCallInfo>[];
+    final re = RegExp(r'\+CLCC:\s*(\d+),(\d+),(\d+),\d+,\d+,"([^"]*)"');
+    for (final m in re.allMatches(raw)) {
+      list.add(ActiveCallInfo(
+        id: int.tryParse(m.group(1)!) ?? 1,
+        dir: int.tryParse(m.group(2)!) ?? 0,
+        state: int.tryParse(m.group(3)!) ?? 0,
+        number: m.group(4) ?? '',
+      ));
+    }
+    return list;
+  }
+
+  // ---------------- SIM Contacts (CPBR / CPBW) ----------------
+
+  Future<List<SimContact>> readSimContacts() async {
+    await exec('AT+CPBS="SM"');
+    await exec('AT+CSCS="UCS2"');
+    final raw = await exec('AT+CPBR=1,250', timeout: const Duration(seconds: 8));
+    final contacts = <SimContact>[];
+    final re = RegExp(r'\+CPBR:\s*(\d+),"([^"]*)",\d+,"([^"]*)"');
+    for (final m in re.allMatches(raw)) {
+      final idx = int.tryParse(m.group(1)!) ?? 0;
+      final phone = Ucs2Codec.decodeSmart(m.group(2) ?? '');
+      final name = Ucs2Codec.decodeSmart(m.group(3) ?? '');
+      contacts.add(SimContact(index: idx, name: name, phone: phone));
+    }
+    return contacts;
+  }
+
+  Future<bool> writeSimContact({
+    int? index,
+    required String phone,
+    required String name,
+  }) async {
+    await exec('AT+CPBS="SM"');
+    await exec('AT+CSCS="UCS2"');
+    final numType = phone.trim().startsWith('+') ? 145 : 129;
+    final hexName = Ucs2Codec.encodeHex(name.trim());
+    final idxPart = index != null ? '$index' : '';
+    final res =
+        await exec('AT+CPBW=$idxPart,"${phone.trim()}",$numType,"$hexName"');
+    return res.contains('OK');
+  }
+
+  Future<bool> deleteSimContact(int index) async {
+    await exec('AT+CPBS="SM"');
+    final res = await exec('AT+CPBW=$index');
+    return res.contains('OK');
+  }
+
+  // ---------------- Modes & Admin ----------------
 
   Future<bool> setNetworkMode(String syscfgCommand) async {
     final res = await exec(syscfgCommand);
@@ -190,6 +452,8 @@ class HuaweiE173Service {
     await exec('AT+CFUN=1,1');
   }
 
+  // ---------------- Helpers ----------------
+
   String? _extractLineValue(String raw, String prefix) {
     for (final line in raw.split(RegExp(r'\r?\n'))) {
       final trimmed = line.trim();
@@ -198,6 +462,25 @@ class HuaweiE173Service {
       }
     }
     return null;
+  }
+
+  (String, bool) _parseCreg(String raw) {
+    final m = RegExp(r'\+CREG:\s*\d+,(\d+)').firstMatch(raw);
+    if (m == null) return ('Неизвестно', false);
+    final stat = int.tryParse(m.group(1)!) ?? 0;
+    switch (stat) {
+      case 1:
+        return ('Зарегистрирован (домашняя сеть)', true);
+      case 5:
+        return ('Зарегистрирован (роуминг)', true);
+      case 2:
+        return ('Поиск сети...', false);
+      case 3:
+        return ('Регистрация отклонена', false);
+      case 0:
+      default:
+        return ('Нет регистрации', false);
+    }
   }
 
   String _parseSysInfo(String raw) {
@@ -228,7 +511,7 @@ class HuaweiE173Service {
     final state = m.group(1);
     final attempts = m.group(2);
     if (state == '2') return 'Разблокирован (все SIM)';
-    if (state == '1') return 'Заблокирован (осталось попыток: $attempts)';
-    return 'Код статуса: $state';
+    if (state == '1') return 'Заблокирован (попыток: $attempts)';
+    return 'Статус $state';
   }
 }

@@ -11,6 +11,7 @@ permissions:
 
 env:
   APP_NAME: huawei_e173_manager
+  APP_VERSION: 2.0.0
   APP_DIR: flutter_app
 
 jobs:
@@ -27,7 +28,7 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Подготовить Windows Runner
+      - name: Подготовить Windows Runner и иконку приложения (окно, панель задач, трей)
         working-directory: ${{ env.APP_DIR }}
         shell: pwsh
         run: |
@@ -39,15 +40,70 @@ jobs:
             Move-Item -Force "main.dart.bak" "lib/main.dart"
             if (Test-Path "test/widget_test.dart") { Remove-Item -Force "test/widget_test.dart" }
           }
+
+          # Генерация 32x32 32-bit ARGB Windows .ico (фирменная иконка для окна, панели задач и трея)
+          New-Item -ItemType Directory -Force -Path "assets" | Out-Null
+          $w = 32; $h = 32
+          $xorSize = $w * $h * 4
+          $andSize = $h * 4
+          $imgSize = 40 + $xorSize + $andSize
+          $ms = New-Object System.IO.MemoryStream
+          $bw = New-Object System.IO.BinaryWriter($ms)
+          # ICONDIR
+          $bw.Write([UInt16]0); $bw.Write([UInt16]1); $bw.Write([UInt16]1)
+          # ICONDIRENTRY
+          $bw.Write([Byte]$w); $bw.Write([Byte]$h); $bw.Write([Byte]0); $bw.Write([Byte]0)
+          $bw.Write([UInt16]1); $bw.Write([UInt16]32)
+          $bw.Write([UInt32]$imgSize); $bw.Write([UInt32]22)
+          # BITMAPINFOHEADER
+          $bw.Write([UInt32]40); $bw.Write([Int32]$w); $bw.Write([Int32]($h * 2))
+          $bw.Write([UInt16]1); $bw.Write([UInt16]32); $bw.Write([UInt32]0)
+          $bw.Write([UInt32]($xorSize + $andSize))
+          $bw.Write([Int32]0); $bw.Write([Int32]0); $bw.Write([UInt32]0); $bw.Write([UInt32]0)
+          # Пиксели BGRA снизу вверх: тёмно-синий закруглённый квадрат + белые полосы сигнала 3G
+          for ($y = $h - 1; $y -ge 0; $y--) {
+            for ($x = 0; $x -lt $w; $x++) {
+              $dx = [Math]::Max(0, [Math]::Max(5 - $x, $x - 26))
+              $dy = [Math]::Max(0, [Math]::Max(5 - $y, $y - 26))
+              $inRounded = ($dx * $dx + $dy * $dy) -le 25
+              if (-not $inRounded) {
+                $bw.Write([Byte]0); $bw.Write([Byte]0); $bw.Write([Byte]0); $bw.Write([Byte]0)
+              } else {
+                $bar1 = ($x -ge 6 -and $x -le 9 -and $y -ge 20 -and $y -le 25)
+                $bar2 = ($x -ge 12 -and $x -le 15 -and $y -ge 15 -and $y -le 25)
+                $bar3 = ($x -ge 18 -and $x -le 21 -and $y -ge 10 -and $y -le 25)
+                $bar4 = ($x -ge 24 -and $x -le 26 -and $y -ge 6 -and $y -le 25)
+                if ($bar1 -or $bar2 -or $bar3) {
+                  $bw.Write([Byte]255); $bw.Write([Byte]255); $bw.Write([Byte]255); $bw.Write([Byte]255)
+                } elseif ($bar4) {
+                  $bw.Write([Byte]248); $bw.Write([Byte]189); $bw.Write([Byte]56); $bw.Write([Byte]255)
+                } else {
+                  $bw.Write([Byte]42); $bw.Write([Byte]23); $bw.Write([Byte]15); $bw.Write([Byte]255)
+                }
+              }
+            }
+          }
+          for ($i = 0; $i -lt $andSize; $i++) { $bw.Write([Byte]0) }
+          $bw.Flush()
+          [System.IO.File]::WriteAllBytes((Join-Path (Get-Location) "assets/app_icon.ico"), $ms.ToArray())
+          if (Test-Path "windows/runner/resources") {
+            Copy-Item -Force "assets/app_icon.ico" "windows/runner/resources/app_icon.ico"
+          }
+          $bw.Dispose(); $ms.Dispose()
+
           if (Test-Path "windows/runner/main.cpp") {
             $cpp = Get-Content "windows/runner/main.cpp" -Raw
-            $cpp = $cpp -replace 'window\.Create\(L"[^"]*"', 'window.Create(L"Huawei E173 Portable Manager"'
+            $cpp = $cpp -replace 'window\.Create\(L"[^"]*"', 'window.Create(L"Huawei E173 Portable Manager v${{ env.APP_VERSION }}"'
             Set-Content -Path "windows/runner/main.cpp" -Value $cpp -NoNewline
           }
 
       - name: Установить зависимости Flutter
         working-directory: ${{ env.APP_DIR }}
         run: flutter pub get
+
+      - name: Проверить код (flutter analyze)
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
       - name: Собрать Windows x64 Release
         working-directory: ${{ env.APP_DIR }}
@@ -57,24 +113,28 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         shell: pwsh
         run: |
-          $outDir = "dist/${{ env.APP_NAME }}-portable-win64"
+          $outDir = "dist/${{ env.APP_NAME }}-v${{ env.APP_VERSION }}-portable-win64"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
           Copy-Item -Recurse -Force "build/windows/x64/runner/Release/*" $outDir
+          Copy-Item -Force "assets/app_icon.ico" "$outDir/app_icon.ico"
+          New-Item -ItemType Directory -Force -Path "$outDir/UserData/Excel" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$outDir/UserData/Sounds" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$outDir/UserData/Exports" | Out-Null
           "PORTABLE_MODE=1" | Set-Content -Path "$outDir/portable.flag" -Encoding UTF8
           @('@echo off', 'cd /d "%~dp0"', 'start "" "huawei_e173_manager.exe"') | Set-Content -Path "$outDir/Start_Portable.bat" -Encoding ASCII
-          $archive = "${{ env.APP_NAME }}-portable-win64.zip"
+          $archive = "${{ env.APP_NAME }}-v${{ env.APP_VERSION }}-portable-win64.zip"
           Compress-Archive -Path "$outDir/*" -DestinationPath $archive -Force
 
       - name: Загрузить портативный ZIP в Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: huawei_e173_manager-portable-win64
-          path: flutter_app/huawei_e173_manager-portable-win64.zip
+          name: huawei_e173_manager-v${{ env.APP_VERSION }}-portable-win64
+          path: flutter_app/huawei_e173_manager-v${{ env.APP_VERSION }}-portable-win64.zip
           retention-days: 30
 
       - name: Создать GitHub Release при пуше тега v*
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: flutter_app/huawei_e173_manager-portable-win64.zip
+          files: flutter_app/huawei_e173_manager-v${{ env.APP_VERSION }}-portable-win64.zip
           generate_release_notes: true

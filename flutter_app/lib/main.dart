@@ -1,18 +1,39 @@
 import 'package:flutter/material.dart';
-import 'ui/modem_home.dart';
+import 'app_version.dart';
+import 'services/modem_controller.dart';
+import 'services/tray_window_service.dart';
+import 'ui/main_shell.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const HuaweiE173App());
+
+  final controller = ModemController();
+  final trayService = TrayWindowService(
+    shouldMinimizeToTray: () => controller.settings.minimizeToTrayOnClose,
+    onWindowVisibilityChanged: controller.setWindowHidden,
+    onExitRequested: controller.shutdown,
+  );
+
+  await trayService.init();
+  await controller.init();
+
+  runApp(HuaweiE173App(controller: controller, trayService: trayService));
 }
 
 class HuaweiE173App extends StatelessWidget {
-  const HuaweiE173App({super.key});
+  final ModemController controller;
+  final TrayWindowService trayService;
+
+  const HuaweiE173App({
+    super.key,
+    required this.controller,
+    required this.trayService,
+  });
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Huawei E173 Portable Manager',
+      title: AppVersion.windowTitle,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -22,7 +43,7 @@ class HuaweiE173App extends StatelessWidget {
         ),
         scaffoldBackgroundColor: const Color(0xFFF8FAFC),
       ),
-      home: const ModemHomePage(),
+      home: MainShell(controller: controller, trayService: trayService),
     );
   }
 }

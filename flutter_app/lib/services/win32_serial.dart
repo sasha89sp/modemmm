@@ -54,6 +54,16 @@ final class COMMTIMEOUTS extends Struct {
   external int writeTotalTimeoutConstant;
 }
 
+// Win32 COMSTAT (12 байт)
+final class COMSTAT extends Struct {
+  @Uint32()
+  external int flags;
+  @Uint32()
+  external int cbInQue;
+  @Uint32()
+  external int cbOutQue;
+}
+
 typedef _CreateFileWNative = IntPtr Function(
   Pointer<Utf16> lpFileName,
   Uint32 dwDesiredAccess,
@@ -89,6 +99,17 @@ typedef _SetCommTimeoutsDart = int Function(
 typedef _PurgeCommNative = Int32 Function(IntPtr hFile, Uint32 dwFlags);
 typedef _PurgeCommDart = int Function(int hFile, int dwFlags);
 
+typedef _ClearCommErrorNative = Int32 Function(
+  IntPtr hFile,
+  Pointer<Uint32> lpErrors,
+  Pointer<COMSTAT> lpStat,
+);
+typedef _ClearCommErrorDart = int Function(
+  int hFile,
+  Pointer<Uint32> lpErrors,
+  Pointer<COMSTAT> lpStat,
+);
+
 typedef _ReadWriteFileNative = Int32 Function(
   IntPtr hFile,
   Pointer<Uint8> lpBuffer,
@@ -111,7 +132,7 @@ typedef _GetLastErrorNative = Uint32 Function();
 typedef _GetLastErrorDart = int Function();
 
 /// Нативный драйвер Windows COM-порта через dart:ffi + kernel32.dll.
-/// Не требует внешних DLL (libserialport) и гарантирует 100% портативность.
+/// Поддерживает мгновенное освобождение при извлечении USB и чтение URC (+CMTI, RING, +CUSD).
 class Win32SerialPort {
   static const int _invalidHandleValue = -1;
   static const int _genericReadWrite = 0xC0000000;
@@ -125,6 +146,7 @@ class Win32SerialPort {
   late final _GetSetCommStateDart _setCommState;
   late final _SetCommTimeoutsDart _setCommTimeouts;
   late final _PurgeCommDart _purgeComm;
+  late final _ClearCommErrorDart _clearCommError;
   late final _ReadWriteFileDart _readFile;
   late final _ReadWriteFileDart _writeFile;
   late final _CloseHandleDart _closeHandle;
@@ -133,14 +155,18 @@ class Win32SerialPort {
   int _handle = _invalidHandleValue;
   String? _portName;
   bool _busy = false;
+  void Function(String reason)? onUnexpectedDisconnect;
+  void Function(String line)? onUnsolicitedLine;
 
   bool get isOpen => _handle != _invalidHandleValue;
+  bool get isBusy => _busy;
   String? get portName => _portName;
 
-  Win32SerialPort() {
-    if (!Platform.isWindows) {
-      throw UnsupportedError('Win32SerialPort работает только в Windows.');
-    }
+  Win32SerialPort({
+    this.onUnexpectedDisconnect,
+    this.onUnsolicitedLine,
+  }) {
+    if (!Platform.isWindows) return;
     _kernel32 = DynamicLibrary.open('kernel32.dll');
     _createFileW = _kernel32
         .lookupFunction<_CreateFileWNative, _CreateFileWDart>('CreateFileW');
@@ -155,6 +181,9 @@ class Win32SerialPort {
             'SetCommTimeouts');
     _purgeComm = _kernel32
         .lookupFunction<_PurgeCommNative, _PurgeCommDart>('PurgeComm');
+    _clearCommError = _kernel32
+        .lookupFunction<_ClearCommErrorNative, _ClearCommErrorDart>(
+            'ClearCommError');
     _readFile = _kernel32
         .lookupFunction<_ReadWriteFileNative, _ReadWriteFileDart>('ReadFile');
     _writeFile = _kernel32
@@ -165,7 +194,24 @@ class Win32SerialPort {
         .lookupFunction<_GetLastErrorNative, _GetLastErrorDart>('GetLastError');
   }
 
-  /// Поиск доступных COM-портов с определением интерфейсов Huawei E173 (VID_12D1).
+  /// Быстрый список активных COM-портов из реестра Windows (для экономичного мониторинга USB).
+  static Future<Set<String>> listQuickPortNames() async {
+    if (!Platform.isWindows) return {};
+    try {
+      final reg = await Process.run(
+        'reg',
+        ['query', r'HKLM\HARDWARE\DEVICEMAP\SERIALCOMM'],
+      );
+      return RegExp(r'COM\d+')
+          .allMatches(reg.stdout.toString())
+          .map((m) => m.group(0)!)
+          .toSet();
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// Полное сканирование COM-портов с чтением PnP-метаданных (VID_12D1, PC UI, Modem, Application/Voice).
   static Future<List<ComPortInfo>> scanPorts() async {
     final results = <ComPortInfo>[];
     if (!Platform.isWindows) return results;
@@ -196,46 +242,49 @@ class Win32SerialPort {
           final lower = name.toLowerCase();
           final isHuawei = deviceId.toUpperCase().contains('VID_12D1') ||
               lower.contains('huawei');
-          final isPcUi = isHuawei &&
-              (lower.contains('pc ui') || lower.contains('application'));
+          final isPcUi = isHuawei && lower.contains('pc ui');
+          final isModem = isHuawei && lower.contains('modem');
+          final isVoice = isHuawei &&
+              (lower.contains('application') ||
+                  lower.contains('voice') ||
+                  lower.contains('audio') ||
+                  lower.contains('diag'));
 
           results.add(ComPortInfo(
             port: port,
             description: name,
             deviceId: deviceId,
             isHuaweiPcUi: isPcUi,
+            isHuaweiModem: isModem,
+            isHuaweiVoiceCandidate: isVoice,
           ));
         }
       }
     } catch (_) {
-      final reg = await Process.run(
-        'reg',
-        ['query', r'HKLM\HARDWARE\DEVICEMAP\SERIALCOMM'],
-      );
-      final matches = RegExp(r'COM\d+').allMatches(reg.stdout.toString());
-      for (final m in matches) {
-        final p = m.group(0)!;
-        if (!results.any((e) => e.port == p)) {
-          results.add(ComPortInfo(
-            port: p,
-            description: 'Последовательный порт $p',
-            deviceId: '',
-            isHuaweiPcUi: false,
-          ));
-        }
+      final quick = await listQuickPortNames();
+      for (final p in quick) {
+        results.add(ComPortInfo(
+          port: p,
+          description: 'Последовательный порт $p',
+          deviceId: '',
+          isHuaweiPcUi: false,
+        ));
       }
     }
 
     results.sort((a, b) {
-      if (a.isHuaweiPcUi != b.isHuaweiPcUi) {
-        return a.isHuaweiPcUi ? -1 : 1;
-      }
+      final diff = b.priorityScore.compareTo(a.priorityScore);
+      if (diff != 0) return diff;
       return a.port.compareTo(b.port);
     });
     return results;
   }
 
-  void open(String port, {int baudRate = 115200}) {
+  void open(
+    String port, {
+    int baudRate = 115200,
+    int readTimeoutMs = 120,
+  }) {
     close();
     final path = '\\\\.\\${port.trim().toUpperCase()}';
     final pathPtr = path.toNativeUtf16();
@@ -252,11 +301,11 @@ class Win32SerialPort {
       );
       if (h == _invalidHandleValue) {
         throw StateError(
-          'Не удалось открыть $port (код Win32: ${_getLastError()}). Проверьте, не занят ли порт.',
+          'Не удалось открыть $port (Win32 код: ${_getLastError()}). Возможно, порт занят.',
         );
       }
       _handle = h;
-      _portName = port;
+      _portName = port.trim().toUpperCase();
 
       final dcb = calloc<DCB>();
       final timeouts = calloc<COMMTIMEOUTS>();
@@ -267,8 +316,8 @@ class Win32SerialPort {
         }
         dcb.ref.baudRate = baudRate;
         dcb.ref.byteSize = 8;
-        dcb.ref.parity = 0; // NOPARITY
-        dcb.ref.stopBits = 0; // ONESTOPBIT
+        dcb.ref.parity = 0;
+        dcb.ref.stopBits = 0;
         // fBinary=1, fDtrControl=ENABLE (1), fRtsControl=ENABLE (1)
         dcb.ref.flags = 0x00001011;
 
@@ -276,11 +325,11 @@ class Win32SerialPort {
           throw StateError('Ошибка SetCommState: ${_getLastError()}');
         }
 
-        timeouts.ref.readIntervalTimeout = 30;
-        timeouts.ref.readTotalTimeoutMultiplier = 10;
-        timeouts.ref.readTotalTimeoutConstant = 150;
+        timeouts.ref.readIntervalTimeout = 20;
+        timeouts.ref.readTotalTimeoutMultiplier = 5;
+        timeouts.ref.readTotalTimeoutConstant = readTimeoutMs;
         timeouts.ref.writeTotalTimeoutMultiplier = 10;
-        timeouts.ref.writeTotalTimeoutConstant = 500;
+        timeouts.ref.writeTotalTimeoutConstant = 400;
         _setCommTimeouts(_handle, timeouts);
         _purgeComm(_handle, _purgeRxClear | _purgeTxClear);
       } finally {
@@ -300,6 +349,75 @@ class Win32SerialPort {
     }
   }
 
+  /// Проверяет, жив ли дескриптор порта (мгновенно обнаруживает извлечение USB).
+  bool checkAlive() {
+    if (!isOpen) return false;
+    final errs = calloc<Uint32>();
+    final stat = calloc<COMSTAT>();
+    try {
+      final ok = _clearCommError(_handle, errs, stat);
+      if (ok == 0) {
+        final code = _getLastError();
+        _handleDisconnect('USB-устройство извлечено (ClearCommError: $code)');
+        return false;
+      }
+      return true;
+    } finally {
+      calloc.free(errs);
+      calloc.free(stat);
+    }
+  }
+
+  /// Вычитывает необработанные входящие байты без блокировки (для перехвата +CMTI, RING и т.д.).
+  void pollUnsolicited() {
+    if (!isOpen || _busy) return;
+    final errs = calloc<Uint32>();
+    final stat = calloc<COMSTAT>();
+    int queued = 0;
+    try {
+      final ok = _clearCommError(_handle, errs, stat);
+      if (ok == 0) {
+        _handleDisconnect('USB-порт потерян при фоновом чтении');
+        return;
+      }
+      queued = stat.ref.cbInQue;
+    } finally {
+      calloc.free(errs);
+      calloc.free(stat);
+    }
+
+    if (queued > 0) {
+      final data = readAvailable(maxBytes: queued > 4096 ? 4096 : queued);
+      if (data.isNotEmpty) {
+        final text = latin1.decode(data, allowInvalid: true);
+        _dispatchUnsolicitedLines(text);
+      }
+    }
+  }
+
+  void _dispatchUnsolicitedLines(String raw) {
+    final cb = onUnsolicitedLine;
+    if (cb == null) return;
+    for (final line in raw.split(RegExp(r'[\r\n]+'))) {
+      final clean = line.trim();
+      if (clean.isEmpty) continue;
+      if (clean.startsWith('+CMTI:') ||
+          clean.startsWith('+CDS:') ||
+          clean.startsWith('+CLIP:') ||
+          clean == 'RING' ||
+          clean.startsWith('^CEND:') ||
+          clean.startsWith('^CONN:')) {
+        cb(clean);
+      }
+    }
+  }
+
+  void _handleDisconnect(String reason) {
+    if (!isOpen) return;
+    close();
+    onUnexpectedDisconnect?.call(reason);
+  }
+
   void writeBytes(Uint8List bytes) {
     if (!isOpen) throw StateError('Порт не открыт');
     final buf = calloc<Uint8>(bytes.length);
@@ -308,7 +426,11 @@ class Win32SerialPort {
       buf.asTypedList(bytes.length).setAll(0, bytes);
       final ok = _writeFile(_handle, buf, bytes.length, written, nullptr);
       if (ok == 0) {
-        throw StateError('Ошибка записи в COM-порт: ${_getLastError()}');
+        final code = _getLastError();
+        if (code == 31 || code == 22 || code == 1167 || code == 5 || code == 6) {
+          _handleDisconnect('Порт отключён при записи (Win32 код $code)');
+        }
+        throw StateError('Ошибка записи в COM-порт (код $code)');
       }
     } finally {
       calloc.free(buf);
@@ -322,9 +444,14 @@ class Win32SerialPort {
     final readCount = calloc<Uint32>();
     try {
       final ok = _readFile(_handle, buf, maxBytes, readCount, nullptr);
-      if (ok == 0 || readCount.value == 0) {
+      if (ok == 0) {
+        final code = _getLastError();
+        if (code == 31 || code == 22 || code == 1167 || code == 5 || code == 6) {
+          _handleDisconnect('Порт отключён при чтении (Win32 код $code)');
+        }
         return Uint8List(0);
       }
+      if (readCount.value == 0) return Uint8List(0);
       return Uint8List.fromList(buf.asTypedList(readCount.value));
     } finally {
       calloc.free(buf);
@@ -336,14 +463,20 @@ class Win32SerialPort {
     String command, {
     Duration timeout = const Duration(seconds: 3),
     String? expectToken,
+    bool waitForTokenLineEnd = false,
   }) async {
     if (!isOpen) throw StateError('Сначала подключитесь к COM-порту модема.');
     while (_busy) {
-      await Future.delayed(const Duration(milliseconds: 25));
+      await Future.delayed(const Duration(milliseconds: 20));
     }
     _busy = true;
     try {
-      _purgeComm(_handle, _purgeRxClear);
+      // Сохраняем любые ожидающие URC до очистки буфера
+      final pre = readAvailable(maxBytes: 2048);
+      if (pre.isNotEmpty) {
+        _dispatchUnsolicitedLines(latin1.decode(pre, allowInvalid: true));
+      }
+
       final payload = utf8.encode('$command\r');
       writeBytes(Uint8List.fromList(payload));
 
@@ -351,22 +484,44 @@ class Win32SerialPort {
       final deadline = DateTime.now().add(timeout);
 
       while (DateTime.now().isBefore(deadline)) {
+        if (!isOpen) break;
         final chunk = readAvailable();
         if (chunk.isNotEmpty) {
-          buffer.write(latin1.decode(chunk, allowInvalid: true));
+          final decodedChunk = latin1.decode(chunk, allowInvalid: true);
+          buffer.write(decodedChunk);
+          _dispatchUnsolicitedLines(decodedChunk);
           final text = buffer.toString();
-          if (expectToken != null && text.contains(expectToken)) {
-            return text;
-          }
-          if (text.contains('\r\nOK\r\n') ||
-              text.trimRight().endsWith('OK') ||
-              text.contains('\r\nERROR\r\n') ||
+
+          if (text.contains('\r\nERROR\r\n') ||
+              text.trimRight().endsWith('\nERROR') ||
+              text.trim() == 'ERROR' ||
               text.contains('+CMS ERROR') ||
               text.contains('+CME ERROR')) {
             return text;
           }
+
+          if (expectToken != null) {
+            final idx = text.indexOf(expectToken);
+            if (idx != -1) {
+              if (!waitForTokenLineEnd) return text;
+              final after = text.substring(idx);
+              if (after.contains('\n') || after.contains('\r')) {
+                await Future.delayed(const Duration(milliseconds: 120));
+                final tail = readAvailable();
+                if (tail.isNotEmpty) {
+                  buffer.write(latin1.decode(tail, allowInvalid: true));
+                }
+                return buffer.toString();
+              }
+            }
+          } else {
+            if (text.contains('\r\nOK\r\n') ||
+                text.trimRight().endsWith('OK')) {
+              return text;
+            }
+          }
         }
-        await Future.delayed(const Duration(milliseconds: 35));
+        await Future.delayed(const Duration(milliseconds: 30));
       }
       return buffer.toString();
     } finally {
@@ -376,7 +531,7 @@ class Win32SerialPort {
 
   Future<String> sendRawWithCtrlZ(
     String body, {
-    Duration timeout = const Duration(seconds: 8),
+    Duration timeout = const Duration(seconds: 10),
   }) async {
     if (!isOpen) throw StateError('Порт не открыт');
     final bytes = <int>[...utf8.encode(body), 0x1A];
@@ -385,6 +540,7 @@ class Win32SerialPort {
     final buffer = StringBuffer();
     final deadline = DateTime.now().add(timeout);
     while (DateTime.now().isBefore(deadline)) {
+      if (!isOpen) break;
       final chunk = readAvailable();
       if (chunk.isNotEmpty) {
         buffer.write(latin1.decode(chunk, allowInvalid: true));
@@ -393,7 +549,7 @@ class Win32SerialPort {
           return text;
         }
       }
-      await Future.delayed(const Duration(milliseconds: 50));
+      await Future.delayed(const Duration(milliseconds: 45));
     }
     return buffer.toString();
   }
