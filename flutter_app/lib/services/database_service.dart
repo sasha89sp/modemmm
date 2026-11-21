@@ -5,12 +5,26 @@ import 'package:sqlite3/sqlite3.dart';
 import '../models/modem_models.dart';
 import '../models/scenario_models.dart';
 import 'app_paths.dart';
+import 'debug_profiler_service.dart';
 
 /// Локальное хранилище SQLite (UserData/modem_data.db):
 /// SMS со всех SIM-карт с папками и «надгробиями», сценарии, прогоны, журналы и экспорт CSV.
 class DatabaseService {
   Database? _db;
   int _sysLogInsertCount = 0;
+  DebugProfilerService? profiler;
+
+  T _trackRead<T>(String detail, T Function() fn) {
+    final p = profiler;
+    if (p == null || !p.enabled) return fn();
+    return p.trackSync('sqlite_read', fn, detail: detail);
+  }
+
+  T _trackWrite<T>(String detail, T Function() fn) {
+    final p = profiler;
+    if (p == null || !p.enabled) return fn();
+    return p.trackSync('sqlite_write', fn, detail: detail);
+  }
 
   Database get db {
     final instance = _db;
@@ -198,66 +212,72 @@ class DatabaseService {
     int? modemIndex,
     String deliveryStatus = '',
   }) {
-    final fp = buildSmsFingerprint(
-      imsi: simImsi,
-      folder: folder,
-      address: address,
-      timestamp: timestamp,
-      body: body,
-    );
-    if (isTombstoned(fp)) return false;
+    return _trackWrite('insertSmsIfNew($folder)', () {
+      final fp = buildSmsFingerprint(
+        imsi: simImsi,
+        folder: folder,
+        address: address,
+        timestamp: timestamp,
+        body: body,
+      );
+      if (isTombstoned(fp)) return false;
 
-    final existing = db.select(
-      'SELECT id FROM messages WHERE fingerprint = ? LIMIT 1',
-      [fp],
-    );
-    if (existing.isNotEmpty) return false;
+      final existing = db.select(
+        'SELECT id FROM messages WHERE fingerprint = ? LIMIT 1',
+        [fp],
+      );
+      if (existing.isNotEmpty) return false;
 
-    db.execute(
-      '''INSERT INTO messages
-         (fingerprint, sim_imsi, folder, prev_folder, address, body, timestamp, is_read, modem_index, delivery_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-      [
-        fp,
-        simImsi,
-        folder,
-        folder,
-        address,
-        body,
-        timestamp,
-        isRead ? 1 : 0,
-        modemIndex,
-        deliveryStatus,
-      ],
-    );
-    return true;
+      db.execute(
+        '''INSERT INTO messages
+           (fingerprint, sim_imsi, folder, prev_folder, address, body, timestamp, is_read, modem_index, delivery_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        [
+          fp,
+          simImsi,
+          folder,
+          folder,
+          address,
+          body,
+          timestamp,
+          isRead ? 1 : 0,
+          modemIndex,
+          deliveryStatus,
+        ],
+      );
+      return true;
+    });
   }
 
   List<SmsRecord> getMessages({String? folder, String search = ''}) {
-    final where = <String>[];
-    final args = <Object?>[];
+    return _trackRead('getMessages(${folder ?? 'all'})', () {
+      final where = <String>[];
+      final args = <Object?>[];
 
-    if (folder != null && folder.isNotEmpty) {
-      where.add('folder = ?');
-      args.add(folder);
-    }
-    if (search.trim().isNotEmpty) {
-      where.add('(address LIKE ? OR body LIKE ? OR sim_imsi LIKE ?)');
-      final q = '%${search.trim()}%';
-      args.addAll([q, q, q]);
-    }
+      if (folder != null && folder.isNotEmpty) {
+        where.add('folder = ?');
+        args.add(folder);
+      }
+      if (search.trim().isNotEmpty) {
+        where.add('(address LIKE ? OR body LIKE ? OR sim_imsi LIKE ?)');
+        final q = '%${search.trim()}%';
+        args.addAll([q, q, q]);
+      }
 
-    final sql =
-        'SELECT * FROM messages ${where.isNotEmpty ? 'WHERE ${where.join(' AND ')}' : ''} ORDER BY id DESC LIMIT 1000';
-    final rows = db.select(sql, args);
-    return rows.map(_mapSmsRow).toList();
+      final sql =
+          'SELECT * FROM messages ${where.isNotEmpty ? 'WHERE ${where.join(' AND ')}' : ''} ORDER BY id DESC LIMIT 1000';
+      final rows = db.select(sql, args);
+      return rows.map(_mapSmsRow).toList();
+    });
   }
 
   int getUnreadInboxCount() {
-    final rows = db.select(
-      "SELECT COUNT(*) AS cnt FROM messages WHERE folder = 'inbox' AND is_read = 0",
-    );
-    return (rows.first['cnt'] as int?) ?? 0;
+    return _trackRead('getUnreadInboxCount', () {
+      final rows = db.select(
+        "SELECT COUNT(*) AS cnt FROM messages WHERE folder = 'inbox' AND is_read = 0",
+      );
+      return (rows.first['cnt'] as int?) ?? 0;
+    });
   }
 
   void markSmsRead(List<int> ids, {bool read = true}) {
@@ -429,70 +449,78 @@ class DatabaseService {
     String result, [
     String details = '',
   ]) {
-    db.execute(
-      'INSERT INTO operation_logs (created_at, category, action, result, details) VALUES (?, ?, ?, ?, ?)',
-      [nowIso(), category, action, result, details],
-    );
+    _trackWrite('logOperation($category)', () {
+      db.execute(
+        'INSERT INTO operation_logs (created_at, category, action, result, details) VALUES (?, ?, ?, ?, ?)',
+        [nowIso(), category, action, result, details],
+      );
+    });
   }
 
   void logSystem(String level, String message) {
     if (_db == null) return;
-    try {
-      db.execute(
-        'INSERT INTO system_logs (created_at, level, message) VALUES (?, ?, ?)',
-        [nowIso(), level, message],
-      );
-      _sysLogInsertCount++;
-      if (_sysLogInsertCount >= 200) {
-        _sysLogInsertCount = 0;
+    _trackWrite('logSystem($level)', () {
+      try {
         db.execute(
-          'DELETE FROM system_logs WHERE id <= COALESCE((SELECT id FROM system_logs ORDER BY id DESC LIMIT 1 OFFSET 5000), 0)',
+          'INSERT INTO system_logs (created_at, level, message) VALUES (?, ?, ?)',
+          [nowIso(), level, message],
         );
+        _sysLogInsertCount++;
+        if (_sysLogInsertCount >= 200) {
+          _sysLogInsertCount = 0;
+          db.execute(
+            'DELETE FROM system_logs WHERE id <= COALESCE((SELECT id FROM system_logs ORDER BY id DESC LIMIT 1 OFFSET 5000), 0)',
+          );
+        }
+      } catch (_) {
+        // Не допускаем сбоя UI при ошибке записи системного лога
       }
-    } catch (_) {
-      // Не допускаем сбоя UI при ошибке записи системного лога
-    }
+    });
   }
 
   List<OperationLogEntry> getOperationLogs({int limit = 500}) {
-    final rows = db.select(
-      'SELECT * FROM operation_logs ORDER BY id DESC LIMIT ?',
-      [limit],
-    );
-    return rows
-        .map(
-          (r) => OperationLogEntry(
-            id: r['id'] as int,
-            createdAt: r['created_at'] as String,
-            category: r['category'] as String,
-            action: r['action'] as String,
-            result: r['result'] as String,
-            details: r['details'] as String,
-          ),
-        )
-        .toList();
+    return _trackRead('getOperationLogs', () {
+      final rows = db.select(
+        'SELECT * FROM operation_logs ORDER BY id DESC LIMIT ?',
+        [limit],
+      );
+      return rows
+          .map(
+            (r) => OperationLogEntry(
+              id: r['id'] as int,
+              createdAt: r['created_at'] as String,
+              category: r['category'] as String,
+              action: r['action'] as String,
+              result: r['result'] as String,
+              details: r['details'] as String,
+            ),
+          )
+          .toList();
+    });
   }
 
   List<SystemLogEntry> getSystemLogs({int limit = 500, String? level}) {
-    final rows = level != null && level.isNotEmpty
-        ? db.select(
-            'SELECT * FROM system_logs WHERE level = ? ORDER BY id DESC LIMIT ?',
-            [level, limit],
+    return _trackRead('getSystemLogs', () {
+      final rows = level != null && level.isNotEmpty
+          ? db.select(
+              'SELECT * FROM system_logs WHERE level = ? ORDER BY id DESC LIMIT ?',
+              [level, limit],
+            )
+          : db.select(
+              'SELECT * FROM system_logs ORDER BY id DESC LIMIT ?',
+              [limit],
+            );
+      return rows
+          .map(
+            (r) => SystemLogEntry(
+              id: r['id'] as int,
+              createdAt: r['created_at'] as String,
+              level: r['level'] as String,
+              message: r['message'] as String,
+            ),
           )
-        : db.select(
-            'SELECT * FROM system_logs ORDER BY id DESC LIMIT ?',
-            [limit],
-          );
-    return rows
-        .map(
-          (r) => SystemLogEntry(
-            id: r['id'] as int,
-            createdAt: r['created_at'] as String,
-            level: r['level'] as String,
-            message: r['message'] as String,
-          ),
-        )
-        .toList();
+          .toList();
+    });
   }
 
   void clearSystemLogs() => db.execute('DELETE FROM system_logs');

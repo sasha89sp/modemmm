@@ -118,6 +118,15 @@ class AppSettings {
   bool requestSmsDeliveryReport;
   bool smsSoundEnabled;
   double smsSoundVolume; // 0.0 .. 1.0
+  bool smsPopupEnabled;
+
+  // Входящие звонки и оповещения
+  bool callRingtoneEnabled;
+  double callRingtoneVolume; // 0.0 .. 1.0
+  bool callPopupEnabled;
+
+  // Отладка и профилировщик производительности (выключена по умолчанию)
+  bool debugProfilerEnabled;
 
   // Оптимизация и трей
   bool minimizeToTrayOnClose;
@@ -147,6 +156,11 @@ class AppSettings {
     this.requestSmsDeliveryReport = false,
     this.smsSoundEnabled = true,
     this.smsSoundVolume = 0.8,
+    this.smsPopupEnabled = true,
+    this.callRingtoneEnabled = true,
+    this.callRingtoneVolume = 0.85,
+    this.callPopupEnabled = true,
+    this.debugProfilerEnabled = false,
     this.minimizeToTrayOnClose = true,
     this.activePollSec = 6,
     this.idlePollSec = 20,
@@ -201,6 +215,14 @@ class AppSettings {
             ((raw['smsSoundVolume'] as num?)?.toDouble() ?? 0.8)
                 .clamp(0.0, 1.0)
                 .toDouble(),
+        smsPopupEnabled: raw['smsPopupEnabled'] as bool? ?? true,
+        callRingtoneEnabled: raw['callRingtoneEnabled'] as bool? ?? true,
+        callRingtoneVolume:
+            ((raw['callRingtoneVolume'] as num?)?.toDouble() ?? 0.85)
+                .clamp(0.0, 1.0)
+                .toDouble(),
+        callPopupEnabled: raw['callPopupEnabled'] as bool? ?? true,
+        debugProfilerEnabled: raw['debugProfilerEnabled'] as bool? ?? false,
         minimizeToTrayOnClose: raw['minimizeToTrayOnClose'] as bool? ?? true,
         activePollSec: (raw['activePollSec'] as num?)?.toInt() ?? 6,
         idlePollSec: (raw['idlePollSec'] as num?)?.toInt() ?? 20,
@@ -244,6 +266,11 @@ class AppSettings {
       'requestSmsDeliveryReport': requestSmsDeliveryReport,
       'smsSoundEnabled': smsSoundEnabled,
       'smsSoundVolume': smsSoundVolume,
+      'smsPopupEnabled': smsPopupEnabled,
+      'callRingtoneEnabled': callRingtoneEnabled,
+      'callRingtoneVolume': callRingtoneVolume,
+      'callPopupEnabled': callPopupEnabled,
+      'debugProfilerEnabled': debugProfilerEnabled,
       'minimizeToTrayOnClose': minimizeToTrayOnClose,
       'activePollSec': activePollSec,
       'idlePollSec': idlePollSec,

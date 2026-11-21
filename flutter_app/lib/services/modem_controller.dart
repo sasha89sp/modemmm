@@ -5,8 +5,10 @@ import '../models/modem_models.dart';
 import '../models/scenario_models.dart';
 import 'app_paths.dart';
 import 'database_service.dart';
+import 'debug_profiler_service.dart';
 import 'excel_exporter.dart';
 import 'huawei_e173_service.dart';
+import 'pdu_codec.dart';
 import 'ras_dialer.dart';
 import 'scenario_engine.dart';
 import 'voice_service.dart';
@@ -29,15 +31,46 @@ class _LoopStats {
   double get avgMs => count == 0 ? 0 : totalMs / count;
 }
 
+enum PopupNotificationType { incomingCall, incomingSms }
+
+class PopupNotificationData {
+  final String id;
+  final PopupNotificationType type;
+  final String title;
+  final String senderOrNumber;
+  final String contactName;
+  final String body;
+  final String timestamp;
+  final int smsCount;
+  final bool isTest;
+
+  const PopupNotificationData({
+    required this.id,
+    required this.type,
+    required this.title,
+    required this.senderOrNumber,
+    this.contactName = '',
+    this.body = '',
+    this.timestamp = '',
+    this.smsCount = 1,
+    this.isTest = false,
+  });
+
+  String get displaySender => contactName.isNotEmpty
+      ? '$contactName ($senderOrNumber)'
+      : senderOrNumber;
+}
+
 /// Главный координатор приложения:
 /// - Мгновенный запуск UI (initLocal) + асинхронная инициализация портов (startHardwareAndLoops);
 /// - USB Hotplug (мгновенное освобождение при извлечении и автопереподключение при возврате);
 /// - адаптивные интервалы (активный / простой / свёрнуто / 60с при отсутствии SIM);
 /// - кэширование счётчика непрочитанных SMS и пропуск лишних перерисовок UI;
-/// - автосинхронизация SMS (+CMTI и расписание) + звуковое оповещение winmm.dll;
-/// - автозапуск сценариев при регистрации в сети с защитой от повтора в сессии;
-/// - телеметрия длительности фоновых циклов DIAG.
+/// - автосинхронизация SMS (+CMTI и расписание), звуковые оповещения SMS и входящего звонка (winmm.dll);
+/// - всплывающие окна поверх всех окон для SMS и входящих звонков;
+/// - встроенный профилировщик и отладчик производительности в реальном времени (выключаемый).
 class ModemController extends ChangeNotifier {
+  final DebugProfilerService profiler = DebugProfilerService();
   final DatabaseService db = DatabaseService();
   final WinmmAudio audio = WinmmAudio();
   late final Win32SerialPort serial;
@@ -60,6 +93,7 @@ class ModemController extends ChangeNotifier {
   final List<String> scenarioProgressLog = [];
 
   String? incomingCallerNumber;
+  bool incomingRingtoneMuted = false;
   String callStateBanner = '';
   String voiceCapabilityStatus = 'Не проверено';
   bool? voiceCapabilityEnabled;
@@ -68,6 +102,11 @@ class ModemController extends ChangeNotifier {
   bool busy = false;
   bool initialized = false;
   bool _hardwareStarted = false;
+
+  // Активное всплывающее уведомление поверх всех окон (SMS или входящий звонок)
+  PopupNotificationData? activePopup;
+  Future<void> Function({required bool isCall})? onPopupShowRequested;
+  Future<void> Function({bool restoreFullWindow})? onPopupDismissRequested;
 
   // Кэш и версии данных (исключают синхронные SQLite-запросы на каждом кадре build())
   int _unreadSmsCount = 0;
@@ -84,6 +123,8 @@ class ModemController extends ChangeNotifier {
   Timer? _statusLoopTimer;
   Timer? _smsLoopTimer;
   Timer? _atNotifyDebounce;
+  Timer? _ringWatchdogTimer;
+  Timer? _smsPopupAutoHideTimer;
 
   bool _usbLoopRunning = false;
   bool _statusLoopRunning = false;
@@ -101,12 +142,21 @@ class ModemController extends ChangeNotifier {
   final _smsStats = _LoopStats();
 
   ModemController() {
+    db.profiler = profiler;
     serial = Win32SerialPort(
       onUnexpectedDisconnect: _handleUnexpectedUsbDisconnect,
       onUnsolicitedLine: _handleUnsolicitedLine,
     );
-    modem = HuaweiE173Service(serial, onLog: _handleAtLog);
-    voice = VoiceService(audio, onChanged: _safeNotify);
+    modem = HuaweiE173Service(
+      serial,
+      onLog: _handleAtLog,
+      profiler: profiler,
+    );
+    voice = VoiceService(
+      audio,
+      onChanged: () => _safeNotify('voice_service'),
+      profiler: profiler,
+    );
     scenarioEngine = ScenarioEngine(
       modem: modem,
       db: db,
@@ -118,7 +168,7 @@ class ModemController extends ChangeNotifier {
           '[${DatabaseService.nowIso().substring(11)}] $line',
         );
         if (scenarioProgressLog.length > 300) scenarioProgressLog.removeLast();
-        _safeNotify();
+        _safeNotify('scenario_progress');
       },
     );
   }
@@ -144,7 +194,9 @@ class ModemController extends ChangeNotifier {
           maxDurationMs: _usbStats.maxMs,
           executions: _usbStats.count,
           currentIntervalSec: _windowHiddenOrMinimized ? 6 : 3,
-          stateNote: _windowHiddenOrMinimized ? 'Окно скрыто' : 'Активен (Win32 реестр)',
+          stateNote: _windowHiddenOrMinimized
+              ? 'Окно скрыто'
+              : 'Активен (Win32 реестр)',
         ),
         DiagMetric(
           loopName: 'Мониторинг модема/сети',
@@ -174,8 +226,11 @@ class ModemController extends ChangeNotifier {
         ),
       ];
 
-  void _safeNotify() {
+  void _safeNotify([String source = 'general']) {
     if (!_disposed) {
+      if (profiler.enabled) {
+        profiler.recordUiNotify(source);
+      }
       notifyListeners();
     }
   }
@@ -200,8 +255,23 @@ class ModemController extends ChangeNotifier {
   void setWindowHidden(bool hidden) {
     if (_windowHiddenOrMinimized == hidden) return;
     _windowHiddenOrMinimized = hidden;
+    profiler.logEvent(
+      level: 'PROC',
+      category: 'UI',
+      subsystem: 'window_state',
+      message: hidden
+          ? 'Окно скрыто/свёрнуто -> переход на интервал ${currentStatusIntervalSec}с'
+          : 'Окно активно -> интервал ${currentStatusIntervalSec}с',
+    );
     _rescheduleStatusLoop();
-    _safeNotify();
+    _safeNotify('window_visibility');
+  }
+
+  Future<void> setDebugProfilerEnabled(bool enabled) async {
+    settings.debugProfilerEnabled = enabled;
+    profiler.setEnabled(enabled);
+    await settings.save();
+    _safeNotify('profiler_toggle');
   }
 
   /// Фаза 1: быстрая локальная инициализация (настройки + SQLite, ~20 мс) до показа первого кадра UI.
@@ -209,6 +279,7 @@ class ModemController extends ChangeNotifier {
     if (initialized) return;
     await AppPaths.ensureDirectories();
     settings = await AppSettings.load();
+    profiler.setEnabled(settings.debugProfilerEnabled);
     await db.init();
     scenarios = db.getScenarios();
     scenarioRuns = db.getScenarioRuns();
@@ -223,7 +294,7 @@ class ModemController extends ChangeNotifier {
     _hardwareStarted = true;
 
     voicePhrases = await voice.listPhrases();
-    _safeNotify();
+    _safeNotify('phrases_loaded');
 
     await scanPorts();
     _startBackgroundLoops();
@@ -240,6 +311,9 @@ class ModemController extends ChangeNotifier {
     _statusLoopTimer?.cancel();
     _smsLoopTimer?.cancel();
     _atNotifyDebounce?.cancel();
+    _ringWatchdogTimer?.cancel();
+    _smsPopupAutoHideTimer?.cancel();
+    profiler.dispose();
     voice.dispose();
     audio.dispose();
     serial.close();
@@ -248,7 +322,7 @@ class ModemController extends ChangeNotifier {
 
   void _emitToast(String msg) {
     lastToastMessage = msg;
-    _safeNotify();
+    _safeNotify('toast');
   }
 
   void clearToast() {
@@ -270,7 +344,7 @@ class ModemController extends ChangeNotifier {
     if (!_windowHiddenOrMinimized && _atNotifyDebounce == null) {
       _atNotifyDebounce = Timer(const Duration(milliseconds: 250), () {
         _atNotifyDebounce = null;
-        _safeNotify();
+        _safeNotify('at_log');
       });
     }
   }
@@ -286,8 +360,198 @@ class ModemController extends ChangeNotifier {
       db.logSystem('RX', res.trim());
       _bumpLogsVersion();
     }
-    _safeNotify();
+    _safeNotify('manual_at');
     return res;
+  }
+
+  // ---------------- Поиск имени контакта и всплывающие уведомления ----------------
+
+  String resolveContactName(String rawNumber) {
+    final digits = rawNumber.replaceAll(RegExp(r'\D'), '');
+    if (digits.length < 7 || contacts.isEmpty) return '';
+    final tail = digits.length > 10 ? digits.substring(digits.length - 10) : digits;
+    for (final ct in contacts) {
+      final cDigits = ct.phone.replaceAll(RegExp(r'\D'), '');
+      if (cDigits.isEmpty) continue;
+      final cTail =
+          cDigits.length > 10 ? cDigits.substring(cDigits.length - 10) : cDigits;
+      if (cTail == tail && ct.name.trim().isNotEmpty) {
+        return ct.name.trim();
+      }
+    }
+    return '';
+  }
+
+  void _startRingtoneIfEnabled() {
+    if (!settings.callRingtoneEnabled || incomingRingtoneMuted) return;
+    if (audio.isRingtonePlaying) return;
+    profiler.trackSync('audio_sound', () {
+      audio.playCallRingtone(
+        volume: settings.callRingtoneVolume,
+        loop: true,
+      );
+    }, detail: 'incoming_call_ringtone');
+  }
+
+  void _stopIncomingRingtone() {
+    _ringWatchdogTimer?.cancel();
+    _ringWatchdogTimer = null;
+    if (audio.isRingtonePlaying) {
+      audio.stopCallRingtone();
+    }
+  }
+
+  void muteCurrentRingtone() {
+    incomingRingtoneMuted = true;
+    audio.stopCallRingtone();
+    _safeNotify('ringtone_muted');
+  }
+
+  void testCallRingtone({bool stop = false}) {
+    if (stop || audio.isRingtonePlaying) {
+      audio.stopCallRingtone();
+    } else {
+      profiler.trackSync('audio_sound', () {
+        audio.playCallRingtone(
+          volume: settings.callRingtoneVolume,
+          loop: false,
+        );
+      }, detail: 'test_call_ringtone');
+    }
+    _safeNotify('test_ringtone');
+  }
+
+  Future<void> _presentPopup(PopupNotificationData data) async {
+    _smsPopupAutoHideTimer?.cancel();
+    _smsPopupAutoHideTimer = null;
+
+    activePopup = data;
+    _safeNotify('popup_show');
+
+    await profiler.trackAsync('popup_window', () async {
+      await onPopupShowRequested?.call(
+        isCall: data.type == PopupNotificationType.incomingCall,
+      );
+    }, detail: data.type == PopupNotificationType.incomingCall ? 'call' : 'sms');
+
+    // SMS-уведомление автоматически скрывается через 14 секунд (звонок остаётся до ответа/сброса)
+    if (data.type == PopupNotificationType.incomingSms) {
+      final popupId = data.id;
+      _smsPopupAutoHideTimer = Timer(const Duration(seconds: 14), () {
+        if (activePopup?.id == popupId) {
+          unawaited(dismissActivePopup(restoreFullWindow: false));
+        }
+      });
+    }
+  }
+
+  Future<void> dismissActivePopup({bool restoreFullWindow = false}) async {
+    _smsPopupAutoHideTimer?.cancel();
+    _smsPopupAutoHideTimer = null;
+
+    final wasTestCall = activePopup?.isTest == true &&
+        activePopup?.type == PopupNotificationType.incomingCall;
+    if (wasTestCall) {
+      _stopIncomingRingtone();
+      incomingRingtoneMuted = false;
+    }
+
+    activePopup = null;
+    _safeNotify('popup_dismiss');
+    await onPopupDismissRequested?.call(restoreFullWindow: restoreFullWindow);
+  }
+
+  Future<void> triggerTestSmsPopup() async {
+    if (settings.smsSoundEnabled) {
+      profiler.trackSync('audio_sound', () {
+        audio.playSmsNotification(volume: settings.smsSoundVolume);
+      }, detail: 'test_sms_sound');
+    }
+    await _presentPopup(PopupNotificationData(
+      id: 'test-sms-${DateTime.now().millisecondsSinceEpoch}',
+      type: PopupNotificationType.incomingSms,
+      title: 'Новое входящее SMS (тест)',
+      senderOrNumber: '+7 999 000-00-00',
+      contactName: 'Проверка уведомления',
+      body: 'Пример всплывающего окна SMS поверх всех окон Windows. Его можно отключить в Настройках.',
+      timestamp: DatabaseService.nowIso(),
+      smsCount: 1,
+      isTest: true,
+    ));
+  }
+
+  Future<void> triggerTestCallPopup() async {
+    incomingRingtoneMuted = false;
+    if (settings.callRingtoneEnabled) {
+      profiler.trackSync('audio_sound', () {
+        audio.playCallRingtone(
+          volume: settings.callRingtoneVolume,
+          loop: true,
+        );
+      }, detail: 'test_call_popup_ringtone');
+    }
+    await _presentPopup(PopupNotificationData(
+      id: 'test-call-${DateTime.now().millisecondsSinceEpoch}',
+      type: PopupNotificationType.incomingCall,
+      title: 'Входящий звонок (тест)',
+      senderOrNumber: '+7 999 123-45-67',
+      contactName: 'Тестовый абонент',
+      body: 'Проверка всплывающего окна входящего вызова поверх всех окон Windows.',
+      timestamp: DatabaseService.nowIso(),
+      isTest: true,
+    ));
+  }
+
+  Future<void> answerIncomingCall() async {
+    final isTest = activePopup?.isTest == true;
+    _stopIncomingRingtone();
+    incomingRingtoneMuted = false;
+    if (isTest) {
+      await dismissActivePopup(restoreFullWindow: false);
+      _emitToast('Тестовый входящий звонок принят.');
+      return;
+    }
+    if (serial.isOpen) {
+      await modem.answerCall();
+      final voicePort = settings.preferredVoicePort;
+      if (voicePort.isNotEmpty &&
+          voicePort != serial.portName &&
+          !voice.isBridgeActive) {
+        try {
+          voice.startVoiceBridge(voicePort);
+        } catch (_) {}
+      }
+      incomingCallerNumber = null;
+      callStateBanner = 'Разговор активен';
+      await dismissActivePopup(restoreFullWindow: true);
+      await refreshActiveCalls();
+    } else {
+      await dismissActivePopup(restoreFullWindow: false);
+    }
+  }
+
+  Future<void> rejectIncomingCall() async {
+    final isTest = activePopup?.isTest == true;
+    _stopIncomingRingtone();
+    incomingRingtoneMuted = false;
+    if (isTest) {
+      await dismissActivePopup(restoreFullWindow: false);
+      _emitToast('Тестовый входящий звонок сброшен.');
+      return;
+    }
+    if (serial.isOpen) {
+      await modem.hangupCall();
+    }
+    voice.stopVoiceBridge();
+    incomingCallerNumber = null;
+    callStateBanner = '';
+    activeCalls = [];
+    await dismissActivePopup(restoreFullWindow: false);
+    if (serial.isOpen) {
+      await refreshActiveCalls();
+    } else {
+      _safeNotify('call_rejected');
+    }
   }
 
   // ---------------- USB Hotplug & Port Management ----------------
@@ -295,9 +559,13 @@ class ModemController extends ChangeNotifier {
   Future<void> scanPorts() async {
     if (_scanningPorts) return;
     _scanningPorts = true;
-    _safeNotify();
+    _safeNotify('scan_ports_start');
     try {
-      final found = await Win32SerialPort.scanPorts();
+      final found = await profiler.trackAsync(
+        'port_pnp_scan',
+        () => Win32SerialPort.scanPorts(),
+        detail: 'Win32_PnPEntity',
+      );
       ports = found;
       _knownPortNames = found.map((e) => e.port).toSet();
 
@@ -322,7 +590,7 @@ class ModemController extends ChangeNotifier {
       }
     } finally {
       _scanningPorts = false;
-      _safeNotify();
+      _safeNotify('scan_ports_done');
     }
   }
 
@@ -330,7 +598,7 @@ class ModemController extends ChangeNotifier {
     if (busy || (serial.isOpen && serial.portName == port)) return;
     busy = true;
     _manualDisconnected = false;
-    _safeNotify();
+    _safeNotify('connect_start');
 
     try {
       serial.open(port, baudRate: settings.baudRate);
@@ -348,7 +616,14 @@ class ModemController extends ChangeNotifier {
       _applySnapshotIfChanged(next);
       db.logOperation('Подключение', 'Открыт порт $port', 'OK',
           '${next.model} · ${next.imei} · ${next.simStatus}');
-      db.logSystem('INFO', 'Подключён модем $port (${next.model}, ${next.simStatus})');
+      db.logSystem(
+          'INFO', 'Подключён модем $port (${next.model}, ${next.simStatus})');
+      profiler.logEvent(
+        level: 'PROC',
+        category: 'MODEM',
+        subsystem: 'connect',
+        message: 'Подключён порт $port (${next.model}, ${next.simStatus})',
+      );
       _bumpLogsVersion();
       _emitToast('Подключено к $port (${next.model})');
 
@@ -365,16 +640,24 @@ class ModemController extends ChangeNotifier {
       serial.close();
       _applySnapshotIfChanged(const ModemSnapshot());
       db.logSystem('ERR', 'Ошибка подключения к $port: $e');
+      profiler.logEvent(
+        level: 'ERR',
+        category: 'MODEM',
+        subsystem: 'connect',
+        message: 'Ошибка подключения к $port: $e',
+      );
       _bumpLogsVersion();
       if (!isAuto) _emitToast('Ошибка подключения: $e');
     } finally {
       busy = false;
-      _safeNotify();
+      _safeNotify('connect_done');
     }
   }
 
   void disconnectPort({bool manual = true}) {
     _manualDisconnected = manual;
+    _stopIncomingRingtone();
+    incomingRingtoneMuted = false;
     voice.stopVoiceBridge();
     final prevPort = serial.portName;
     serial.close();
@@ -383,24 +666,99 @@ class ModemController extends ChangeNotifier {
     voiceCapabilityStatus = 'Не проверено';
     voiceCapabilityEnabled = null;
     activeCalls = [];
+    if (activePopup?.type == PopupNotificationType.incomingCall &&
+        activePopup?.isTest != true) {
+      unawaited(dismissActivePopup(restoreFullWindow: false));
+    }
     _applySnapshotIfChanged(const ModemSnapshot());
     if (prevPort != null) {
       db.logOperation('Подключение', 'Закрыт порт $prevPort', 'OK');
+      profiler.logEvent(
+        level: 'PROC',
+        category: 'MODEM',
+        subsystem: 'disconnect',
+        message: 'Порт $prevPort закрыт вручную',
+      );
       _bumpLogsVersion();
     }
-    _safeNotify();
+    _safeNotify('disconnect');
   }
 
   void _handleUnexpectedUsbDisconnect(String reason) {
+    _stopIncomingRingtone();
+    incomingRingtoneMuted = false;
     voice.stopVoiceBridge();
     incomingCallerNumber = null;
     callStateBanner = '';
     activeCalls = [];
+    if (activePopup?.type == PopupNotificationType.incomingCall &&
+        activePopup?.isTest != true) {
+      unawaited(dismissActivePopup(restoreFullWindow: false));
+    }
     _applySnapshotIfChanged(const ModemSnapshot());
     db.logSystem('WARN', 'Мгновенное освобождение порта: $reason');
     db.logOperation('USB Hotplug', 'Модем извлечён', 'Отключён', reason);
+    profiler.logEvent(
+      level: 'WARN',
+      category: 'SYSTEM',
+      subsystem: 'usb_hotplug_scan',
+      message: 'USB-модем извлечён: $reason',
+    );
     _bumpLogsVersion();
     _emitToast('Модем извлечён из USB — порт освобождён.');
+  }
+
+  void _refreshRingWatchdog() {
+    _ringWatchdogTimer?.cancel();
+    _ringWatchdogTimer = Timer(const Duration(seconds: 6), () {
+      // Если 6 секунд подряд не приходил RING (звонящий сбросил без ^CEND) — останавливаем рингтон и окно
+      if (incomingCallerNumber != null &&
+          !callStateBanner.contains('Разговор активен')) {
+        _stopIncomingRingtone();
+        incomingRingtoneMuted = false;
+        incomingCallerNumber = null;
+        callStateBanner = '';
+        if (activePopup?.type == PopupNotificationType.incomingCall &&
+            activePopup?.isTest != true) {
+          unawaited(dismissActivePopup(restoreFullWindow: false));
+        }
+        _safeNotify('ring_timeout');
+      }
+    });
+  }
+
+  void _handleIncomingCallSignal(String? callerNumber) {
+    final isNewRing = incomingCallerNumber == null;
+    if (isNewRing) {
+      incomingRingtoneMuted = false;
+    }
+    final displayNum = (callerNumber != null && callerNumber.trim().isNotEmpty)
+        ? callerNumber.trim()
+        : (incomingCallerNumber ?? 'Неизвестный номер');
+    incomingCallerNumber = displayNum;
+    callStateBanner = 'Входящий вызов: $displayNum';
+
+    _refreshRingWatchdog();
+    _startRingtoneIfEnabled();
+
+    if (settings.callPopupEnabled) {
+      final shouldShowOrUpdate = activePopup == null ||
+          activePopup!.type != PopupNotificationType.incomingCall ||
+          activePopup!.senderOrNumber != displayNum;
+      if (shouldShowOrUpdate) {
+        final contactName = resolveContactName(displayNum);
+        unawaited(_presentPopup(PopupNotificationData(
+          id: 'call-${DateTime.now().millisecondsSinceEpoch}',
+          type: PopupNotificationType.incomingCall,
+          title: 'Входящий звонок',
+          senderOrNumber: displayNum,
+          contactName: contactName,
+          body: 'Модем ${snapshot.port} · ${snapshot.operatorName}',
+          timestamp: DatabaseService.nowIso(),
+        )));
+      }
+    }
+    _safeNotify('incoming_call');
   }
 
   void _handleUnsolicitedLine(String line) {
@@ -412,43 +770,68 @@ class ModemController extends ChangeNotifier {
         lastSyncAt: smsDiag.lastSyncAt,
       );
       db.logSystem('INFO', 'Получено уведомление о новой SMS: $line');
+      profiler.logEvent(
+        level: 'PROC',
+        category: 'MODEM',
+        subsystem: 'urc_serial_poll',
+        message: 'Получен URC новой SMS: $line',
+      );
       _bumpLogsVersion();
       if (settings.autoFetchSms && !snapshot.simMissing) {
         unawaited(syncSmsFromModem(silent: false));
       }
-      _safeNotify();
+      _safeNotify('urc_cmti');
     } else if (line == 'RING') {
-      incomingCallerNumber ??= 'Входящий вызов...';
-      callStateBanner = 'Входящий вызов (RING)';
-      _safeNotify();
+      _handleIncomingCallSignal(null);
     } else if (line.startsWith('+CLIP:')) {
       final m = RegExp(r'\+CLIP:\s*"([^"]+)"').firstMatch(line);
-      if (m != null) {
-        incomingCallerNumber = m.group(1);
-        callStateBanner = 'Входящий вызов: ${m.group(1)}';
-        _safeNotify();
-      }
+      _handleIncomingCallSignal(m?.group(1));
     } else if (line.startsWith('^ORIG:')) {
       callStateBanner = 'Набор номера (^ORIG)...';
-      _safeNotify();
+      _safeNotify('urc_orig');
     } else if (line.startsWith('^CONF:')) {
       callStateBanner = 'Идут гудки (^CONF)...';
-      _safeNotify();
+      _safeNotify('urc_conf');
     } else if (line.startsWith('^CONN:')) {
+      _stopIncomingRingtone();
+      incomingRingtoneMuted = false;
+      incomingCallerNumber = null;
       callStateBanner = 'Разговор активен (^CONN)';
+      if (activePopup?.type == PopupNotificationType.incomingCall &&
+          activePopup?.isTest != true) {
+        unawaited(dismissActivePopup(restoreFullWindow: false));
+      }
       db.logSystem('INFO', 'Соединение установлено: $line');
+      profiler.logEvent(
+        level: 'PROC',
+        category: 'VOICE',
+        subsystem: 'voice_rx_bridge',
+        message: 'Соединение вызова установлено ($line) -> запуск AT^DDSETEX=2',
+      );
       _bumpLogsVersion();
       // На Huawei E173 обязательно активируем AT^DDSETEX=2 именно после ^CONN:
       unawaited(_activateVoiceAudioOnConnect());
-      _safeNotify();
+      _safeNotify('urc_conn');
     } else if (line.startsWith('^CEND:')) {
+      _stopIncomingRingtone();
+      incomingRingtoneMuted = false;
       incomingCallerNumber = null;
       callStateBanner = '';
       activeCalls = [];
       voice.stopVoiceBridge();
+      if (activePopup?.type == PopupNotificationType.incomingCall &&
+          activePopup?.isTest != true) {
+        unawaited(dismissActivePopup(restoreFullWindow: false));
+      }
       db.logSystem('INFO', 'Вызов завершён: $line');
+      profiler.logEvent(
+        level: 'PROC',
+        category: 'VOICE',
+        subsystem: 'voice_rx_bridge',
+        message: 'Вызов завершён ($line)',
+      );
       _bumpLogsVersion();
-      _safeNotify();
+      _safeNotify('urc_cend');
     }
   }
 
@@ -465,6 +848,12 @@ class ModemController extends ChangeNotifier {
       await refreshActiveCalls();
     } catch (e) {
       db.logSystem('WARN', 'Не удалось открыть аудиоканал после ^CONN: $e');
+      profiler.logEvent(
+        level: 'WARN',
+        category: 'VOICE',
+        subsystem: 'voice_rx_bridge',
+        message: 'Ошибка открытия аудиоканала после ^CONN: $e',
+      );
       _bumpLogsVersion();
     }
   }
@@ -476,7 +865,7 @@ class ModemController extends ChangeNotifier {
     voiceCapabilityStatus = enabled
         ? 'Голос включён ($raw)'
         : 'Голос отключён в прошивке ($raw)';
-    _safeNotify();
+    _safeNotify('voice_cap');
   }
 
   Future<(bool ok, String raw)> tryEnableVoiceCapability() async {
@@ -497,7 +886,7 @@ class ModemController extends ChangeNotifier {
     if (!wasRegistered && next.isRegistered && !next.simMissing) {
       _maybeAutoRunScenarios();
     }
-    _safeNotify();
+    _safeNotify('snapshot_changed');
   }
 
   // ---------------- Background Adaptive Loops + DIAG ----------------
@@ -507,7 +896,9 @@ class ModemController extends ChangeNotifier {
     _urcPollTimer?.cancel();
     _urcPollTimer = Timer.periodic(const Duration(milliseconds: 700), (_) {
       if (serial.isOpen && !serial.isBusy && !busy && !scenarioEngine.isRunning) {
-        serial.pollUnsolicited();
+        profiler.trackSync('urc_serial_poll', () {
+          serial.pollUnsolicited();
+        }, detail: serial.portName ?? '');
       }
     });
 
@@ -547,6 +938,11 @@ class ModemController extends ChangeNotifier {
       } finally {
         sw.stop();
         _usbStats.record(sw.elapsedMilliseconds);
+        profiler.recordDuration(
+          'usb_hotplug_scan',
+          sw.elapsedMicroseconds / 1000.0,
+          detail: 'портов: ${_knownPortNames.length}',
+        );
         _usbLoopRunning = false;
       }
     });
@@ -593,10 +989,21 @@ class ModemController extends ChangeNotifier {
         }
       } catch (e) {
         db.logSystem('DIAG', 'Ошибка фонового опроса: $e');
+        profiler.recordDuration(
+          'status_modem_poll',
+          sw.elapsedMicroseconds / 1000.0,
+          detail: '$e',
+          isError: true,
+        );
         _bumpLogsVersion();
       } finally {
         sw.stop();
         _statusStats.record(sw.elapsedMilliseconds);
+        profiler.recordDuration(
+          'status_modem_poll',
+          sw.elapsedMicroseconds / 1000.0,
+          detail: 'интервал ${sec}с',
+        );
         _statusLoopRunning = false;
       }
     });
@@ -620,13 +1027,14 @@ class ModemController extends ChangeNotifier {
     });
   }
 
-  // ---------------- SMS Sync & Sound ----------------
+  // ---------------- SMS Sync, Sound & Topmost Popup ----------------
 
   Future<int> syncSmsFromModem({bool silent = false}) async {
     if (!serial.isOpen || snapshot.simMissing || _smsLoopRunning) return 0;
     _smsLoopRunning = true;
     final sw = Stopwatch()..start();
     var addedCount = 0;
+    AssembledSms? latestNewInbox;
     try {
       final assembled = await modem.readAllSmsPdu();
       for (final msg in assembled) {
@@ -644,6 +1052,7 @@ class ModemController extends ChangeNotifier {
         );
         if (inserted && msg.folder == 'inbox') {
           addedCount++;
+          latestNewInbox = msg;
         }
         if (settings.deleteSmsFromModemAfterSave) {
           for (final idx in msg.modemIndices) {
@@ -659,21 +1068,58 @@ class ModemController extends ChangeNotifier {
         lastSyncAt: DateTime.now(),
       );
 
-      if (addedCount > 0 && !silent && settings.smsSoundEnabled) {
-        audio.playSmsNotification(volume: settings.smsSoundVolume);
+      if (addedCount > 0 && !silent) {
+        if (settings.smsSoundEnabled) {
+          profiler.trackSync('audio_sound', () {
+            audio.playSmsNotification(volume: settings.smsSoundVolume);
+          }, detail: 'sms_chime');
+        }
+        if (settings.smsPopupEnabled &&
+            latestNewInbox != null &&
+            activePopup?.type != PopupNotificationType.incomingCall) {
+          final sender = latestNewInbox.address.trim().isEmpty
+              ? 'Неизвестный отправитель'
+              : latestNewInbox.address.trim();
+          final contactName = resolveContactName(sender);
+          unawaited(_presentPopup(PopupNotificationData(
+            id: 'sms-${DateTime.now().millisecondsSinceEpoch}',
+            type: PopupNotificationType.incomingSms,
+            title: addedCount > 1
+                ? 'Новые входящие SMS ($addedCount)'
+                : 'Новое входящее SMS',
+            senderOrNumber: sender,
+            contactName: contactName,
+            body: latestNewInbox.body,
+            timestamp: latestNewInbox.timestamp.isNotEmpty
+                ? latestNewInbox.timestamp
+                : DatabaseService.nowIso(),
+            smsCount: addedCount,
+          )));
+        }
       }
       if (addedCount > 0) {
         _refreshUnreadCache();
         db.logOperation('SMS', 'Синхронизация PDU', 'Новых: $addedCount');
         _bumpLogsVersion();
-        _safeNotify();
+        _safeNotify('sms_synced');
       }
     } catch (e) {
       db.logSystem('ERR', 'Ошибка синхронизации SMS: $e');
+      profiler.recordDuration(
+        'sms_pdu_sync',
+        sw.elapsedMicroseconds / 1000.0,
+        detail: '$e',
+        isError: true,
+      );
       _bumpLogsVersion();
     } finally {
       sw.stop();
       _smsStats.record(sw.elapsedMilliseconds);
+      profiler.recordDuration(
+        'sms_pdu_sync',
+        sw.elapsedMicroseconds / 1000.0,
+        detail: 'новых: $addedCount',
+      );
       _smsLoopRunning = false;
     }
     return addedCount;
@@ -688,7 +1134,7 @@ class ModemController extends ChangeNotifier {
       cmtiCount: smsDiag.cmtiCount,
       lastSyncAt: smsDiag.lastSyncAt,
     );
-    _safeNotify();
+    _safeNotify('sms_diag');
   }
 
   Future<bool> sendSmsAndStore(String phone, String body) async {
@@ -713,7 +1159,7 @@ class ModemController extends ChangeNotifier {
       _refreshUnreadCache();
       db.logOperation('SMS', 'Отправка на $phone', 'OK');
       _bumpLogsVersion();
-      _safeNotify();
+      _safeNotify('sms_sent');
     } else {
       db.logOperation('SMS', 'Отправка на $phone', 'Ошибка');
       _bumpLogsVersion();
@@ -728,37 +1174,50 @@ class ModemController extends ChangeNotifier {
       fetchStaticInfo: true,
     );
     snapshot = next;
-    _safeNotify();
+    _safeNotify('manual_refresh');
   }
 
   void markSmsRead(List<int> ids, {bool read = true}) {
     db.markSmsRead(ids, read: read);
     _refreshUnreadCache();
-    _safeNotify();
+    _safeNotify('sms_mark_read');
+  }
+
+  void markAllInboxSmsRead() {
+    final unread = db
+        .getMessages(folder: 'inbox')
+        .where((m) => !m.isRead)
+        .map((m) => m.id)
+        .toList();
+    if (unread.isNotEmpty) {
+      markSmsRead(unread, read: true);
+    }
   }
 
   void moveSmsToTrash(List<int> ids) {
     db.moveSmsToTrash(ids);
     _refreshUnreadCache();
-    _safeNotify();
+    _safeNotify('sms_trash');
   }
 
   void restoreSmsFromTrash(List<int> ids) {
     db.restoreSmsFromTrash(ids);
     _refreshUnreadCache();
-    _safeNotify();
+    _safeNotify('sms_restore');
   }
 
   void deleteSmsPermanently(List<int> ids) {
     db.deleteSmsPermanently(ids);
     _refreshUnreadCache();
-    _safeNotify();
+    _safeNotify('sms_delete');
   }
 
   // ---------------- Scenarios Auto-Run & Manual Run ----------------
 
   void _maybeAutoRunScenarios() {
-    if (snapshot.simMissing || !snapshot.isRegistered || scenarioEngine.isRunning) {
+    if (snapshot.simMissing ||
+        !snapshot.isRegistered ||
+        scenarioEngine.isRunning) {
       return;
     }
     final sessionKey = '${snapshot.imei}|${snapshot.imsi}';
@@ -787,35 +1246,43 @@ class ModemController extends ChangeNotifier {
     ScenarioDefinition scenario,
   ) async {
     scenarioProgressLog.clear();
-    _safeNotify();
-    final res = await scenarioEngine.runScenario(
-      scenario: scenario,
-      snapshot: snapshot,
-      settings: settings,
+    _safeNotify('scenario_start');
+    final res = await profiler.trackAsync(
+      'scenario_run',
+      () => scenarioEngine.runScenario(
+        scenario: scenario,
+        snapshot: snapshot,
+        settings: settings,
+      ),
+      detail: scenario.name,
     );
     scenarioRuns = db.getScenarioRuns();
     _bumpLogsVersion();
-    _safeNotify();
+    _safeNotify('scenario_done');
     return res;
   }
 
   void saveScenario(ScenarioDefinition sc) {
     db.upsertScenario(sc);
     scenarios = db.getScenarios();
-    _safeNotify();
+    _safeNotify('scenario_save');
   }
 
   void deleteScenario(String id) {
     db.deleteScenario(id);
     scenarios = db.getScenarios();
-    _safeNotify();
+    _safeNotify('scenario_delete');
   }
 
   Future<ExcelExportResult> rebuildExcelNow() async {
     final allRuns = db.getScenarioRuns(ascending: true);
-    final res = await ExcelExporter.rebuildFromRuns(
-      runs: allRuns,
-      columns: settings.excelColumns,
+    final res = await profiler.trackAsync(
+      'excel_export',
+      () => ExcelExporter.rebuildFromRuns(
+        runs: allRuns,
+        columns: settings.excelColumns,
+      ),
+      detail: 'строк: ${allRuns.length}',
     );
     db.logOperation(
       'Excel',
@@ -824,7 +1291,7 @@ class ModemController extends ChangeNotifier {
       res.savedPath,
     );
     _bumpLogsVersion();
-    _safeNotify();
+    _safeNotify('excel_rebuild');
     return res;
   }
 
@@ -833,18 +1300,18 @@ class ModemController extends ChangeNotifier {
   Future<void> refreshActiveCalls() async {
     if (!serial.isOpen) return;
     activeCalls = await modem.listActiveCalls();
-    _safeNotify();
+    _safeNotify('active_calls');
   }
 
   Future<void> refreshContacts() async {
     if (!serial.isOpen || snapshot.simMissing) return;
     contacts = await modem.readSimContacts();
-    _safeNotify();
+    _safeNotify('contacts');
   }
 
   Future<void> refreshVoicePhrases() async {
     voicePhrases = await voice.listPhrases();
-    _safeNotify();
+    _safeNotify('phrases');
   }
 
   Future<void> connectRasInternet(String apn) async {
@@ -860,20 +1327,21 @@ class ModemController extends ChangeNotifier {
     );
     db.logOperation('Интернет RAS', 'Подключение ($apn)', rasStatus);
     _bumpLogsVersion();
-    _safeNotify();
+    _safeNotify('ras_connect');
   }
 
   Future<void> disconnectRasInternet() async {
     rasStatus = await RasDialer.disconnect();
     db.logOperation('Интернет RAS', 'Отключение', rasStatus);
     _bumpLogsVersion();
-    _safeNotify();
+    _safeNotify('ras_disconnect');
   }
 
   Future<void> saveSettings() async {
+    profiler.setEnabled(settings.debugProfilerEnabled);
     await settings.save();
     _rescheduleStatusLoop();
     _rescheduleSmsLoop();
-    _safeNotify();
+    _safeNotify('save_settings');
   }
 }

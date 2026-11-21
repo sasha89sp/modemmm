@@ -59,12 +59,8 @@ class _CallsTabState extends State<CallsTab> {
   }
 
   Future<void> _hangup() async {
-    await c.modem.hangupCall();
-    c.voice.stopVoiceBridge();
-    c.incomingCallerNumber = null;
-    c.callStateBanner = '';
+    await c.rejectIncomingCall();
     c.db.logOperation('Звонок', 'Завершение вызова', 'OK');
-    await c.refreshActiveCalls();
     if (mounted) setState(() {});
   }
 
@@ -271,15 +267,8 @@ class _CallsTabState extends State<CallsTab> {
                             FilledButton.tonalIcon(
                               onPressed: portConnected
                                   ? () async {
-                                      await c.modem.answerCall();
-                                      if (rememberedVoice.isNotEmpty &&
-                                          rememberedVoice != c.snapshot.port &&
-                                          !c.voice.isBridgeActive) {
-                                        try {
-                                          c.voice.startVoiceBridge(rememberedVoice);
-                                        } catch (_) {}
-                                      }
-                                      await c.refreshActiveCalls();
+                                      await c.answerIncomingCall();
+                                      if (mounted) setState(() {});
                                     }
                                   : null,
                               icon: const Icon(Icons.call_received, size: 18),
@@ -342,6 +331,87 @@ class _CallsTabState extends State<CallsTab> {
                                     .toList(),
                               ),
                             ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 12),
+
+                // Быстрое управление оповещением входящего звонка (звук, громкость, всплывающее окно)
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 12),
+                    child: Wrap(
+                      spacing: 10,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Checkbox(
+                              value: c.settings.callRingtoneEnabled,
+                              onChanged: (v) async {
+                                c.settings.callRingtoneEnabled = v ?? true;
+                                await c.saveSettings();
+                                if (mounted) setState(() {});
+                              },
+                            ),
+                            const Text(
+                              'Звук входящего',
+                              style: TextStyle(fontWeight: FontWeight.w600),
+                            ),
+                          ],
+                        ),
+                        SizedBox(
+                          width: 150,
+                          child: Slider(
+                            value: c.settings.callRingtoneVolume,
+                            min: 0.0,
+                            max: 1.0,
+                            divisions: 20,
+                            label:
+                                '${(c.settings.callRingtoneVolume * 100).round()}%',
+                            onChanged: c.settings.callRingtoneEnabled
+                                ? (v) => setState(
+                                    () => c.settings.callRingtoneVolume = v)
+                                : null,
+                            onChangeEnd: (_) => c.saveSettings(),
+                          ),
+                        ),
+                        Text(
+                            '${(c.settings.callRingtoneVolume * 100).round()}%'),
+                        OutlinedButton.icon(
+                          onPressed: () {
+                            c.testCallRingtone();
+                            setState(() {});
+                          },
+                          icon: Icon(
+                            c.audio.isRingtonePlaying
+                                ? Icons.stop
+                                : Icons.ring_volume,
+                            size: 16,
+                          ),
+                          label: Text(c.audio.isRingtonePlaying
+                              ? 'Стоп'
+                              : 'Тест звука'),
+                        ),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Checkbox(
+                              value: c.settings.callPopupEnabled,
+                              onChanged: (v) async {
+                                c.settings.callPopupEnabled = v ?? true;
+                                await c.saveSettings();
+                                if (mounted) setState(() {});
+                              },
+                            ),
+                            const Text('Окно поверх всех окон'),
                           ],
                         ),
                       ],

@@ -153,7 +153,7 @@ class _SettingsTabState extends State<SettingsTab> {
         const Divider(height: 28),
 
         const Text(
-          'SMS и звуковое оповещение (winmm.dll)',
+          'SMS и оповещения (winmm.dll)',
           style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
         ),
         const SizedBox(height: 8),
@@ -176,7 +176,10 @@ class _SettingsTabState extends State<SettingsTab> {
           title: const Text('Запрашивать отчёт о доставке SMS по умолчанию (+CDS)'),
         ),
         const SizedBox(height: 8),
-        Row(
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             SizedBox(
               width: 220,
@@ -190,32 +193,159 @@ class _SettingsTabState extends State<SettingsTab> {
                 ),
               ),
             ),
-            const SizedBox(width: 20),
-            Checkbox(
-              value: s.smsSoundEnabled,
-              onChanged: (v) => setState(() => s.smsSoundEnabled = v ?? true),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Checkbox(
+                  value: s.smsSoundEnabled,
+                  onChanged: (v) => setState(() => s.smsSoundEnabled = v ?? true),
+                ),
+                const Text('Звук при новом SMS'),
+              ],
             ),
-            const Text('Звук при новом SMS'),
-            const SizedBox(width: 14),
             SizedBox(
-              width: 190,
+              width: 180,
               child: Slider(
                 value: s.smsSoundVolume,
                 min: 0.0,
                 max: 1.0,
-                divisions: 10,
+                divisions: 20,
                 label: '${(s.smsSoundVolume * 100).round()}%',
-                onChanged: (v) => setState(() => s.smsSoundVolume = v),
+                onChanged: s.smsSoundEnabled
+                    ? (v) => setState(() => s.smsSoundVolume = v)
+                    : null,
               ),
             ),
             Text('${(s.smsSoundVolume * 100).round()}%'),
-            const SizedBox(width: 12),
             FilledButton.tonalIcon(
-              onPressed: () => c.audio.playSmsNotification(volume: s.smsSoundVolume),
+              onPressed: () =>
+                  c.audio.playSmsNotification(volume: s.smsSoundVolume),
               icon: const Icon(Icons.volume_up, size: 17),
-              label: const Text('Проверить звук'),
+              label: const Text('Проверить звук SMS'),
             ),
           ],
+        ),
+        const SizedBox(height: 6),
+        Row(
+          children: [
+            Expanded(
+              child: SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: s.smsPopupEnabled,
+                onChanged: (v) => setState(() => s.smsPopupEnabled = v),
+                title: const Text('Всплывающее окно поверх всех окон при новом SMS'),
+                subtitle: const Text(
+                  'Показывает компактное уведомление поверх других программ (даже если окно свёрнуто в трей).',
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            OutlinedButton.icon(
+              onPressed: () => c.triggerTestSmsPopup(),
+              icon: const Icon(Icons.sms_outlined, size: 17),
+              label: const Text('Тест окна SMS'),
+            ),
+          ],
+        ),
+
+        const Divider(height: 28),
+
+        const Text(
+          'Входящие звонки — звук, громкость и всплывающее окно',
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Checkbox(
+                  value: s.callRingtoneEnabled,
+                  onChanged: (v) =>
+                      setState(() => s.callRingtoneEnabled = v ?? true),
+                ),
+                const Text('Звук при входящем звонке'),
+              ],
+            ),
+            SizedBox(
+              width: 190,
+              child: Slider(
+                value: s.callRingtoneVolume,
+                min: 0.0,
+                max: 1.0,
+                divisions: 20,
+                label: '${(s.callRingtoneVolume * 100).round()}%',
+                onChanged: s.callRingtoneEnabled
+                    ? (v) => setState(() => s.callRingtoneVolume = v)
+                    : null,
+              ),
+            ),
+            Text('${(s.callRingtoneVolume * 100).round()}%'),
+            FilledButton.tonalIcon(
+              onPressed: () {
+                c.testCallRingtone();
+                setState(() {});
+              },
+              icon: Icon(
+                c.audio.isRingtonePlaying ? Icons.stop : Icons.ring_volume,
+                size: 17,
+              ),
+              label: Text(
+                c.audio.isRingtonePlaying
+                    ? 'Остановить звонок'
+                    : 'Проверить звонок',
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Row(
+          children: [
+            Expanded(
+              child: SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: s.callPopupEnabled,
+                onChanged: (v) => setState(() => s.callPopupEnabled = v),
+                title: const Text('Всплывающее окно поверх всех окон при входящем звонке'),
+                subtitle: const Text(
+                  'Показывает номер абонента с кнопками «Принять», «Сбросить» и «Тише» поверх всех программ Windows.',
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            OutlinedButton.icon(
+              onPressed: () => c.triggerTestCallPopup(),
+              icon: const Icon(Icons.call_received, size: 17),
+              label: const Text('Тест окна звонка'),
+            ),
+          ],
+        ),
+
+        const Divider(height: 28),
+
+        const Text(
+          'Отладка и профилировщик процессов (в реальном времени)',
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 4),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          value: s.debugProfilerEnabled,
+          onChanged: (v) async {
+            await c.setDebugProfilerEnabled(v);
+            if (mounted) setState(() {});
+          },
+          title: const Text('Включить подробную отладку и мониторинг нагрузки CPU / RAM / подсистем'),
+          subtitle: const Text(
+            'Когда выключено — таймеры и профилировщик полностью остановлены и не создают никакой нагрузки.',
+            style: TextStyle(fontSize: 12),
+          ),
         ),
 
         const Divider(height: 28),

@@ -123,6 +123,7 @@ class WinmmAudio {
   static const int _waveMapper = 0xFFFFFFFF;
   static const int _sndAsync = 0x0001;
   static const int _sndMemory = 0x0004;
+  static const int _sndLoop = 0x0008;
   static const int _sndFilename = 0x00020000;
   static const int _whdrDone = 0x00000001;
 
@@ -145,6 +146,7 @@ class WinmmAudio {
   late final _WaveInSimpleDart _waveInClose;
 
   Pointer<Uint8>? _lastChimeBuf;
+  bool _ringtonePlaying = false;
 
   // Streaming waveOut (8kHz 16-bit mono PCM) с безопасным освобождением по WHDR_DONE
   int _hWaveOut = 0;
@@ -160,6 +162,7 @@ class WinmmAudio {
 
   bool get isRecording => _recording;
   bool get isOutOpen => _hWaveOut != 0;
+  bool get isRingtonePlaying => _ringtonePlaying;
 
   WinmmAudio() {
     if (!Platform.isWindows) return;
@@ -201,10 +204,10 @@ class WinmmAudio {
         .lookupFunction<_WaveInSimpleNative, _WaveInSimpleDart>('waveInClose');
   }
 
-  /// Воспроизводит приятную двухтональную мелодию оповещения SMS через winmm.dll.
-  void playSmsNotification({double volume = 0.8}) {
-    if (!Platform.isWindows || volume <= 0.01) return;
-    final wav = _synthesizeSmsChimeWav(volume.clamp(0.0, 1.0).toDouble());
+  void _playMemoryWav(Uint8List wav, {bool loop = false}) {
+    if (!Platform.isWindows || wav.isEmpty) return;
+    // Сначала останавливаем текущее воспроизведение, чтобы winmm гарантированно освободил старый буфер
+    _playSoundW(nullptr, 0, 0);
     if (_lastChimeBuf != null) {
       calloc.free(_lastChimeBuf!);
       _lastChimeBuf = null;
@@ -212,12 +215,36 @@ class WinmmAudio {
     final ptr = calloc<Uint8>(wav.length);
     ptr.asTypedList(wav.length).setAll(0, wav);
     _lastChimeBuf = ptr;
-    _playSoundW(ptr.cast<Void>(), 0, _sndMemory | _sndAsync);
+    final flags = _sndMemory | _sndAsync | (loop ? _sndLoop : 0);
+    _playSoundW(ptr.cast<Void>(), 0, flags);
+  }
+
+  /// Воспроизводит приятную двухтональную мелодию оповещения SMS через winmm.dll.
+  void playSmsNotification({double volume = 0.8}) {
+    if (!Platform.isWindows || volume <= 0.01) return;
+    _ringtonePlaying = false;
+    final wav = _synthesizeSmsChimeWav(volume.clamp(0.0, 1.0).toDouble());
+    _playMemoryWav(wav, loop: false);
+  }
+
+  /// Воспроизводит синтезированный рингтон входящего звонка через winmm.dll
+  /// с регулировкой громкости и опциональным зацикливанием (SND_LOOP).
+  void playCallRingtone({double volume = 0.85, bool loop = false}) {
+    if (!Platform.isWindows || volume <= 0.01) return;
+    final wav = _synthesizeCallRingtoneWav(volume.clamp(0.0, 1.0).toDouble());
+    _ringtonePlaying = loop;
+    _playMemoryWav(wav, loop: loop);
+  }
+
+  void stopCallRingtone() {
+    _ringtonePlaying = false;
+    stopPlayback();
   }
 
   /// Проигрывает WAV-файл с диска через winmm.dll.
   void playWavFile(String filePath) {
     if (!Platform.isWindows || !File(filePath).existsSync()) return;
+    _ringtonePlaying = false;
     final pathPtr = filePath.toNativeUtf16();
     try {
       _playSoundW(pathPtr.cast<Void>(), 0, _sndFilename | _sndAsync);
@@ -227,6 +254,7 @@ class WinmmAudio {
   }
 
   void stopPlayback() {
+    _ringtonePlaying = false;
     if (!Platform.isWindows) return;
     _playSoundW(nullptr, 0, 0);
   }
@@ -518,7 +546,44 @@ class WinmmAudio {
       pcm.setInt16(i * 2, s.clamp(-32767, 32767).toInt(), Endian.little);
     }
 
-    final pcmBytes = pcm.buffer.asUint8List();
+    return _wrapPcm22kToWav(pcm.buffer.asUint8List(), sr);
+  }
+
+  /// Генерирует классический двойной телефонный рингтон входящего вызова (440+480 Гц, трель 20 Гц, цикл 2.4 сек).
+  static Uint8List _synthesizeCallRingtoneWav(double volume) {
+    const sr = 22050;
+    const totalSamples = 52920; // 2.4 сек (2 импульса по 0.42с + 0.16с пауза + 1.4с тишина)
+    final pcm = ByteData(totalSamples * 2);
+    final amp = (22000 * volume).round();
+
+    for (var i = 0; i < totalSamples; i++) {
+      final t = i / sr;
+      final inFirstBurst = t >= 0.0 && t < 0.42;
+      final inSecondBurst = t >= 0.58 && t < 1.00;
+      if (!inFirstBurst && !inSecondBurst) {
+        pcm.setInt16(i * 2, 0, Endian.little);
+        continue;
+      }
+
+      final localT = inFirstBurst ? t : (t - 0.58);
+      // Мягкая атака и затухание, чтобы не было щелчков
+      double fade = 1.0;
+      if (localT < 0.015) {
+        fade = localT / 0.015;
+      } else if (localT > 0.405) {
+        fade = (0.42 - localT) / 0.015;
+      }
+      final trill = 0.65 + 0.35 * math.sin(2 * math.pi * 20.0 * t);
+      final tone = 0.55 * math.sin(2 * math.pi * 440.0 * t) +
+          0.45 * math.sin(2 * math.pi * 480.0 * t);
+      final s = (tone * trill * fade * amp).round();
+      pcm.setInt16(i * 2, s.clamp(-32767, 32767).toInt(), Endian.little);
+    }
+
+    return _wrapPcm22kToWav(pcm.buffer.asUint8List(), sr);
+  }
+
+  static Uint8List _wrapPcm22kToWav(Uint8List pcmBytes, int sr) {
     final header = ByteData(44 + pcmBytes.length);
     void writeStr(int off, String s) {
       for (var i = 0; i < s.length; i++) {

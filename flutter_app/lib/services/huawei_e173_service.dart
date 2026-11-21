@@ -1,4 +1,5 @@
 import '../models/modem_models.dart';
+import 'debug_profiler_service.dart';
 import 'pdu_codec.dart';
 import 'ucs2_codec.dart';
 import 'win32_serial.dart';
@@ -9,8 +10,9 @@ import 'win32_serial.dart';
 class HuaweiE173Service {
   final Win32SerialPort serial;
   final void Function(String direction, String line)? onLog;
+  final DebugProfilerService? profiler;
 
-  HuaweiE173Service(this.serial, {this.onLog});
+  HuaweiE173Service(this.serial, {this.onLog, this.profiler});
 
   Future<String> exec(
     String cmd, {
@@ -19,12 +21,24 @@ class HuaweiE173Service {
     bool waitForTokenLineEnd = false,
   }) async {
     onLog?.call('TX', cmd);
+    final prof = profiler;
+    final sw = (prof != null && prof.enabled) ? (Stopwatch()..start()) : null;
     final response = await serial.sendCommand(
       cmd,
       timeout: timeout,
       expectToken: expectToken,
       waitForTokenLineEnd: waitForTokenLineEnd,
     );
+    if (sw != null) {
+      sw.stop();
+      final isErr = response.contains('ERROR') || response.trim().isEmpty;
+      prof!.recordDuration(
+        'at_command',
+        sw.elapsedMicroseconds / 1000.0,
+        detail: cmd,
+        isError: isErr && !cmd.startsWith('AT^CARDLOCK'),
+      );
+    }
     for (final line in response.split(RegExp(r'[\r\n]+'))) {
       final clean = line.trim();
       if (clean.isNotEmpty && clean != cmd) {

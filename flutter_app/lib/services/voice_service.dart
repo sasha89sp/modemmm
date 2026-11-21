@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 import 'app_paths.dart';
+import 'debug_profiler_service.dart';
 import 'win32_serial.dart';
 import 'winmm_audio.dart';
 
@@ -24,6 +25,7 @@ class VoiceService {
   final WinmmAudio audio;
   final Win32SerialPort _voicePort = Win32SerialPort();
   final void Function()? onChanged;
+  final DebugProfilerService? profiler;
 
   Timer? _rxTimer;
   bool _bridgeActive = false;
@@ -35,7 +37,7 @@ class VoiceService {
   String? lastVoiceError;
   DateTime _lastCounterNotify = DateTime.fromMillisecondsSinceEpoch(0);
 
-  VoiceService(this.audio, {this.onChanged});
+  VoiceService(this.audio, {this.onChanged, this.profiler});
 
   void _notifyCountersThrottled() {
     final now = DateTime.now();
@@ -86,9 +88,18 @@ class VoiceService {
     _rxBytes = 0;
     _txBytes = 0;
 
+    profiler?.logEvent(
+      level: 'PROC',
+      category: 'VOICE',
+      subsystem: 'voice_rx_bridge',
+      message: 'Запущен аудиомост winmm.dll <-> $comPort (waveOut=${outOk ? 'OK' : 'ERR'})',
+    );
+
     // Приём голоса с модема (8кГц 16-бит моно PCM, 320 байт / 20 мс) -> динамики ПК
     _rxTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
       if (!_bridgeActive || !_voicePort.isOpen) return;
+      final prof = profiler;
+      final sw = (prof != null && prof.enabled) ? (Stopwatch()..start()) : null;
       final chunk = _voicePort.readAvailable(maxBytes: 3200);
       if (chunk.isNotEmpty) {
         _rxBytes += chunk.length;
@@ -97,6 +108,14 @@ class VoiceService {
         }
         _notifyCountersThrottled();
       }
+      if (sw != null) {
+        sw.stop();
+        prof!.recordDuration(
+          'voice_rx_bridge',
+          sw.elapsedMicroseconds / 1000.0,
+          detail: chunk.isEmpty ? 'idle' : 'rx ${chunk.length}B',
+        );
+      }
     });
 
     // Захват с микрофона ПК (320 байт / 20 мс) -> звуковой COM-порт модема
@@ -104,22 +123,48 @@ class VoiceService {
       if (!_bridgeActive || !_voicePort.isOpen || _micMuted || _streamingPhrase) {
         return;
       }
+      final prof = profiler;
+      final sw = (prof != null && prof.enabled) ? (Stopwatch()..start()) : null;
       try {
         _voicePort.writeBytes(pcm);
         _txBytes += pcm.length;
         _notifyCountersThrottled();
+        if (sw != null) {
+          sw.stop();
+          prof!.recordDuration(
+            'voice_tx_mic',
+            sw.elapsedMicroseconds / 1000.0,
+            detail: 'tx ${pcm.length}B',
+          );
+        }
       } catch (e) {
         lastVoiceError = 'Ошибка записи в голосовой порт: $e';
+        if (sw != null) {
+          sw.stop();
+          prof!.recordDuration(
+            'voice_tx_mic',
+            sw.elapsedMicroseconds / 1000.0,
+            detail: '$e',
+            isError: true,
+          );
+        }
         stopVoiceBridge();
       }
     });
     if (!micOk) {
       lastVoiceError = 'Микрофон ПК недоступен (динамики работают на приём).';
+      profiler?.logEvent(
+        level: 'WARN',
+        category: 'VOICE',
+        subsystem: 'voice_tx_mic',
+        message: 'Микрофон ПК недоступен при старте аудиомоста ($comPort)',
+      );
     }
     onChanged?.call();
   }
 
   void stopVoiceBridge() {
+    final wasActive = _bridgeActive;
     _rxTimer?.cancel();
     _rxTimer = null;
     if (_bridgeActive) {
@@ -129,6 +174,14 @@ class VoiceService {
     _bridgeActive = false;
     _streamingPhrase = false;
     _voicePort.close();
+    if (wasActive) {
+      profiler?.logEvent(
+        level: 'PROC',
+        category: 'VOICE',
+        subsystem: 'voice_rx_bridge',
+        message: 'Аудиомост остановлен (итог TX=$_txBytes B, RX=$_rxBytes B)',
+      );
+    }
     onChanged?.call();
   }
 
