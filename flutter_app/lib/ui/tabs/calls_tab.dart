@@ -34,24 +34,38 @@ class _CallsTabState extends State<CallsTab> {
   Future<void> _dial() async {
     final phoneNumber = _dialCtrl.text.trim();
     if (phoneNumber.isEmpty || !c.snapshot.connected) return;
-    final ok = await c.modem.dialVoice(phoneNumber);
-    c.db.logOperation('Звонок', 'Исходящий на $phoneNumber', ok ? 'Набор' : 'Ошибка');
-    if (ok && c.settings.preferredVoicePort.isNotEmpty && !c.voice.isBridgeActive) {
-      try {
-        c.voice.startVoiceBridge(c.settings.preferredVoicePort);
-      } catch (e) {
-        _snack('Звонок набран, но звуковой порт не открыт: $e');
+    c.callStateBanner = 'Набор $phoneNumber...';
+    setState(() {});
+    final (ok, detail) = await c.modem.dialVoiceDetailed(phoneNumber);
+    c.db.logOperation('Звонок', 'Исходящий на $phoneNumber', ok ? 'Набор' : 'Ошибка', detail);
+    if (!ok) {
+      c.callStateBanner = '';
+      _snack('Звонок отклонён модемом: $detail');
+    } else {
+      c.callStateBanner = 'Вызов $phoneNumber (ожидание ^CONN)...';
+      final voicePort = c.settings.preferredVoicePort;
+      if (voicePort.isNotEmpty &&
+          voicePort != c.snapshot.port &&
+          !c.voice.isBridgeActive) {
+        try {
+          c.voice.startVoiceBridge(voicePort);
+        } catch (e) {
+          _snack('Звонок набран, но звуковой порт не открыт: $e');
+        }
       }
     }
     await c.refreshActiveCalls();
+    if (mounted) setState(() {});
   }
 
   Future<void> _hangup() async {
     await c.modem.hangupCall();
     c.voice.stopVoiceBridge();
     c.incomingCallerNumber = null;
+    c.callStateBanner = '';
     c.db.logOperation('Звонок', 'Завершение вызова', 'OK');
     await c.refreshActiveCalls();
+    if (mounted) setState(() {});
   }
 
   Future<void> _stopRecordingAndPromptName() async {
@@ -105,7 +119,8 @@ class _CallsTabState extends State<CallsTab> {
 
   @override
   Widget build(BuildContext context) {
-    final connected = c.snapshot.connected && !c.snapshot.simMissing;
+    final portConnected = c.snapshot.connected;
+    final connected = portConnected && !c.snapshot.simMissing;
     final voicePortItems = <DropdownMenuItem<String>>[];
     for (final p in c.ports) {
       voicePortItems.add(DropdownMenuItem(
@@ -127,6 +142,8 @@ class _CallsTabState extends State<CallsTab> {
         ),
       );
     }
+    final sameAsMainPort =
+        rememberedVoice.isNotEmpty && rememberedVoice == c.snapshot.port;
 
     return Padding(
       padding: const EdgeInsets.all(16),
@@ -144,9 +161,91 @@ class _CallsTabState extends State<CallsTab> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text(
-                          'Управление голосовыми вызовами',
-                          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                        Row(
+                          children: [
+                            const Text(
+                              'Управление голосовыми вызовами',
+                              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                            ),
+                            const Spacer(),
+                            if (c.callStateBanner.isNotEmpty)
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFDCFCE7),
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Text(
+                                  c.callStateBanner,
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                    color: Color(0xFF166534),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        // Диагностика голосовой функции прошивки (AT^CVOICE?)
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 7),
+                          decoration: BoxDecoration(
+                            color: c.voiceCapabilityEnabled == false
+                                ? const Color(0xFFFEF3C7)
+                                : const Color(0xFFF8FAFC),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: c.voiceCapabilityEnabled == false
+                                  ? const Color(0xFFF59E0B)
+                                  : const Color(0xFFE2E8F0),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                c.voiceCapabilityEnabled == true
+                                    ? Icons.check_circle_outline
+                                    : (c.voiceCapabilityEnabled == false
+                                        ? Icons.warning_amber_rounded
+                                        : Icons.info_outline),
+                                size: 17,
+                                color: c.voiceCapabilityEnabled == true
+                                    ? const Color(0xFF166534)
+                                    : (c.voiceCapabilityEnabled == false
+                                        ? const Color(0xFFB45309)
+                                        : Colors.black54),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'Прошивка голоса (AT^CVOICE?): ${c.voiceCapabilityStatus}',
+                                  style: const TextStyle(fontSize: 12),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: portConnected ? c.checkVoiceCapability : null,
+                                child: const Text('Проверить', style: TextStyle(fontSize: 12)),
+                              ),
+                              if (c.voiceCapabilityEnabled == false)
+                                TextButton(
+                                  onPressed: portConnected
+                                      ? () async {
+                                          final (ok, raw) =
+                                              await c.tryEnableVoiceCapability();
+                                          _snack(ok
+                                              ? 'Голос включён (AT^CVOICE=0 -> OK).'
+                                              : 'Модем отклонил AT^CVOICE=0: $raw');
+                                        }
+                                      : null,
+                                  child: const Text('Включить AT^CVOICE=0',
+                                      style: TextStyle(fontSize: 12)),
+                                ),
+                            ],
+                          ),
                         ),
                         const SizedBox(height: 12),
                         Row(
@@ -170,9 +269,16 @@ class _CallsTabState extends State<CallsTab> {
                             ),
                             const SizedBox(width: 6),
                             FilledButton.tonalIcon(
-                              onPressed: connected
+                              onPressed: portConnected
                                   ? () async {
                                       await c.modem.answerCall();
+                                      if (rememberedVoice.isNotEmpty &&
+                                          rememberedVoice != c.snapshot.port &&
+                                          !c.voice.isBridgeActive) {
+                                        try {
+                                          c.voice.startVoiceBridge(rememberedVoice);
+                                        } catch (_) {}
+                                      }
                                       await c.refreshActiveCalls();
                                     }
                                   : null,
@@ -184,7 +290,7 @@ class _CallsTabState extends State<CallsTab> {
                               style: FilledButton.styleFrom(
                                 backgroundColor: const Color(0xFFDC2626),
                               ),
-                              onPressed: connected ? _hangup : null,
+                              onPressed: portConnected ? _hangup : null,
                               icon: const Icon(Icons.call_end, size: 18),
                               label: const Text('Сбросить'),
                             ),
@@ -209,7 +315,7 @@ class _CallsTabState extends State<CallsTab> {
                             ),
                             const SizedBox(width: 8),
                             OutlinedButton(
-                              onPressed: connected
+                              onPressed: portConnected
                                   ? () => c.modem.sendDtmf(_dtmfCtrl.text)
                                   : null,
                               child: const Text('Отправить'),
@@ -227,7 +333,7 @@ class _CallsTabState extends State<CallsTab> {
                                             style: OutlinedButton.styleFrom(
                                               padding: EdgeInsets.zero,
                                             ),
-                                            onPressed: connected
+                                            onPressed: portConnected
                                                 ? () => c.modem.sendDtmf(d)
                                                 : null,
                                             child: Text(d),
@@ -265,7 +371,7 @@ class _CallsTabState extends State<CallsTab> {
                                     ? rememberedVoice
                                     : null,
                                 decoration: const InputDecoration(
-                                  labelText: 'Звуковой COM-порт (обычно Application/Voice)',
+                                  labelText: 'Звуковой COM-порт (выберите 3G Application Interface)',
                                   border: OutlineInputBorder(),
                                   isDense: true,
                                 ),
@@ -280,8 +386,21 @@ class _CallsTabState extends State<CallsTab> {
                               ),
                             ),
                             const SizedBox(width: 8),
+                            OutlinedButton(
+                              onPressed: portConnected
+                                  ? () async {
+                                      final ok =
+                                          await c.modem.enableHuaweiVoiceChannel();
+                                      _snack(ok
+                                          ? 'AT^DDSETEX=2 -> OK (аудиоканал открыт)'
+                                          : 'Модем отклонил AT^DDSETEX=2');
+                                    }
+                                  : null,
+                              child: const Text('AT^DDSETEX=2'),
+                            ),
+                            const SizedBox(width: 8),
                             FilledButton.icon(
-                              onPressed: rememberedVoice.isEmpty
+                              onPressed: rememberedVoice.isEmpty || sameAsMainPort
                                   ? null
                                   : () async {
                                       if (c.voice.isBridgeActive) {
@@ -307,6 +426,29 @@ class _CallsTabState extends State<CallsTab> {
                             ),
                           ],
                         ),
+                        if (sameAsMainPort) ...[
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Внимание: выбран тот же COM-порт, что и основной PC UI. Для голоса выберите отдельный порт (3G Application Interface).',
+                            style: TextStyle(fontSize: 12, color: Color(0xFFB45309)),
+                          ),
+                        ],
+                        if (c.voice.lastVoiceError != null) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'Аудио: ${c.voice.lastVoiceError}',
+                            style: const TextStyle(fontSize: 12, color: Color(0xFFDC2626)),
+                          ),
+                        ],
+                        if (c.voice.isBridgeActive &&
+                            c.voice.txBytes > 32000 &&
+                            c.voice.rxBytes == 0) ...[
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Подсказка: TX идёт, но RX = 0 байт. Проверьте, что выбран порт «3G Application Interface» (не 3G Modem), голос включён (AT^CVOICE?=0) и нажата кнопка AT^DDSETEX=2 после ответа абонента.',
+                            style: TextStyle(fontSize: 12, color: Color(0xFFB45309)),
+                          ),
+                        ],
                         const SizedBox(height: 12),
                         Wrap(
                           spacing: 10,

@@ -354,9 +354,9 @@ class Win32SerialPort {
           '-WindowStyle',
           'Hidden',
           '-Command',
-          r"Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -match '\(COM\d+\)' } | Select-Object Name, DeviceID | ConvertTo-Json -Compress",
+          r"$f = 'Name LIKE ' + [char]39 + '%(COM%' + [char]39; Get-CimInstance Win32_PnPEntity -Filter $f | Select-Object Name, DeviceID | ConvertTo-Json -Compress",
         ],
-      ).timeout(const Duration(seconds: 4));
+      ).timeout(const Duration(seconds: 8));
 
       final out = (proc.stdout as String).trim();
       if (out.isNotEmpty) {
@@ -531,6 +531,8 @@ class Win32SerialPort {
           clean.startsWith('+CDS:') ||
           clean.startsWith('+CLIP:') ||
           clean == 'RING' ||
+          clean.startsWith('^ORIG:') ||
+          clean.startsWith('^CONF:') ||
           clean.startsWith('^CEND:') ||
           clean.startsWith('^CONN:')) {
         cb(clean);
@@ -643,7 +645,11 @@ class Win32SerialPort {
               text.trimRight().endsWith('\nERROR') ||
               text.trim() == 'ERROR' ||
               text.contains('+CMS ERROR') ||
-              text.contains('+CME ERROR')) {
+              text.contains('+CME ERROR') ||
+              text.contains('NO CARRIER') ||
+              text.contains('BUSY') ||
+              text.contains('NO DIALTONE') ||
+              text.contains('NO ANSWER')) {
             return text;
           }
 

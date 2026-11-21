@@ -48,6 +48,7 @@ class HuaweiE173Service {
     await exec('AT+CMEE=2', timeout: const Duration(milliseconds: 1500));
     await exec('AT+CLIP=1', timeout: const Duration(milliseconds: 1500));
     await exec('AT+CNMI=2,1,0,1,0', timeout: const Duration(milliseconds: 1500));
+    await exec('AT+COPS=3,0', timeout: const Duration(milliseconds: 1500));
   }
 
   /// Быстрая проверка наличия SIM (используется в режиме «SIM не обнаружена» раз в 60 сек).
@@ -90,10 +91,24 @@ class HuaweiE173Service {
     }
 
     final cpinRaw =
-        await exec('AT+CPIN?', timeout: const Duration(milliseconds: 1800));
+        await exec('AT+CPIN?', timeout: const Duration(milliseconds: 2200));
     final lowerCpin = cpinRaw.toLowerCase();
 
-    var simStatus = 'SIM не обнаружена';
+    // Если модем временно не успел ответить на AT+CPIN? (например, занят звонком/сетью),
+    // НЕ сбрасываем состояние в «SIM не обнаружена», а сохраняем предыдущий снимок.
+    if (cpinRaw.trim().isEmpty && current.connected && !current.simMissing) {
+      return current.copyWith(
+        connected: serial.isOpen,
+        port: serial.portName ?? current.port,
+        manufacturer: manufacturer,
+        model: model,
+        revision: revision,
+        imei: imei,
+        cardLockStatus: cardLockStatus,
+      );
+    }
+
+    var simStatus = current.simStatus;
     var simMissing = false;
     if (cpinRaw.contains('READY')) {
       simStatus = 'SIM готова';
@@ -102,9 +117,14 @@ class HuaweiE173Service {
     } else if (cpinRaw.contains('SIM PUK')) {
       simStatus = 'Требуется PUK';
     } else if (lowerCpin.contains('not inserted') ||
-        lowerCpin.contains('error') ||
-        cpinRaw.trim().isEmpty) {
+        lowerCpin.contains('sim failure') ||
+        lowerCpin.contains('+cme error: 10') ||
+        lowerCpin.contains('+cme error: 13') ||
+        lowerCpin.contains('+cme error: 15')) {
       simStatus = 'SIM не обнаружена';
+      simMissing = true;
+    } else if (cpinRaw.trim().isEmpty) {
+      simStatus = 'Нет ответа от SIM';
       simMissing = true;
     }
 
@@ -147,7 +167,7 @@ class HuaweiE173Service {
     final sysinfoRaw =
         await exec('AT^SYSINFO', timeout: const Duration(milliseconds: 1500));
 
-    int rssi = 99;
+    int rssi = current.rssi;
     final csqMatch = RegExp(r'\+CSQ:\s*(\d+),').firstMatch(csqRaw);
     if (csqMatch != null) {
       rssi = int.tryParse(csqMatch.group(1)!) ?? 99;
@@ -158,11 +178,11 @@ class HuaweiE173Service {
         : 0;
 
     final regParsed = _parseCreg(cregRaw);
-    var operatorName = 'Поиск сети...';
+    var operatorName = current.operatorName;
     final copsMatch =
         RegExp(r'\+COPS:\s*\d+,\d+,"([^"]+)"').firstMatch(copsRaw);
     if (copsMatch != null) {
-      operatorName = Ucs2Codec.decodeSmart(copsMatch.group(1)!);
+      operatorName = _resolveOperatorName(Ucs2Codec.decodeSmart(copsMatch.group(1)!));
     } else if (!regParsed.$2) {
       operatorName = 'Нет регистрации';
     }
@@ -355,31 +375,80 @@ class HuaweiE173Service {
 
   // ---------------- Voice Calls & DTMF ----------------
 
-  Future<bool> dialVoice(String number) async {
+  /// Проверяет поддержку голоса в прошивке Huawei E173 (AT^CVOICE?).
+  /// ^CVOICE:0,8000,16,20 -> голос включён; ^CVOICE:1 или ERROR -> голос отключён.
+  Future<(bool enabled, String raw)> queryVoiceCapability() async {
+    final res =
+        await exec('AT^CVOICE?', timeout: const Duration(milliseconds: 2000));
+    final clean = res
+        .split(RegExp(r'[\r\n]+'))
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty && e != 'OK')
+        .join(' ');
+    if (res.contains('^CVOICE:0') || res.contains('^CVOICE: 0')) {
+      return (true, clean.isEmpty ? '^CVOICE:0 (Голос включён)' : clean);
+    }
+    return (
+      false,
+      clean.isEmpty ? 'Нет ответа на AT^CVOICE?' : clean,
+    );
+  }
+
+  /// Попытка включить голос в прошивке Huawei E173 (AT^CVOICE=0).
+  Future<(bool ok, String raw)> enableVoiceCapability() async {
+    final res =
+        await exec('AT^CVOICE=0', timeout: const Duration(milliseconds: 2000));
+    return (res.contains('OK'), res.trim());
+  }
+
+  Future<(bool ok, String detail)> dialVoiceDetailed(String number) async {
     final clean = number.trim();
-    if (clean.isEmpty) return false;
-    final res = await exec('ATD$clean;', timeout: const Duration(seconds: 5));
-    await exec('AT^DDSETEX=2'); // Открываем аудиопоток на голосовой COM-порт Huawei E173
-    return res.contains('OK');
+    if (clean.isEmpty) return (false, 'Пустой номер');
+    final res = await exec('ATD$clean;', timeout: const Duration(seconds: 6));
+    final upper = res.toUpperCase();
+    if (upper.contains('NO CARRIER')) {
+      return (false, 'NO CARRIER (линия недоступна или нет регистрации CS)');
+    }
+    if (upper.contains('BUSY')) {
+      return (false, 'BUSY (абонент занят)');
+    }
+    if (upper.contains('NO DIALTONE') || upper.contains('NO ANSWER')) {
+      return (false, res.trim());
+    }
+    if (upper.contains('ERROR')) {
+      return (false, res.trim());
+    }
+    if (res.contains('OK') || res.contains('^ORIG:')) {
+      await exec('AT^DDSETEX=2', timeout: const Duration(milliseconds: 1500));
+      return (true, 'OK');
+    }
+    return (false, res.trim().isEmpty ? 'Таймаут ответа на ATD' : res.trim());
+  }
+
+  Future<bool> dialVoice(String number) async {
+    final (ok, _) = await dialVoiceDetailed(number);
+    return ok;
   }
 
   Future<bool> answerCall() async {
     final res = await exec('ATA', timeout: const Duration(seconds: 4));
-    await exec('AT^DDSETEX=2');
+    await exec('AT^DDSETEX=2', timeout: const Duration(milliseconds: 1500));
     return res.contains('OK');
   }
 
   Future<bool> hangupCall() async {
-    final res = await exec('AT+CHUP');
+    final res = await exec('AT+CHUP', timeout: const Duration(seconds: 3));
     if (!res.contains('OK')) {
-      final res2 = await exec('ATH');
+      final res2 = await exec('ATH', timeout: const Duration(seconds: 3));
       return res2.contains('OK');
     }
     return true;
   }
 
-  Future<void> enableHuaweiVoiceChannel() async {
-    await exec('AT^DDSETEX=2');
+  Future<bool> enableHuaweiVoiceChannel() async {
+    final res =
+        await exec('AT^DDSETEX=2', timeout: const Duration(milliseconds: 1800));
+    return res.contains('OK');
   }
 
   Future<bool> sendDtmf(String digits) async {
@@ -523,6 +592,20 @@ class HuaweiE173Service {
       return '3G WCDMA';
     }
     return 'Нет сети';
+  }
+
+  String _resolveOperatorName(String raw) {
+    final clean = raw.trim();
+    const mccMnc = {
+      '25001': 'МТС (25001)',
+      '25002': 'МегаФон (25002)',
+      '25011': 'Yota (25011)',
+      '25020': 'T2 / Tele2 (25020)',
+      '25099': 'Билайн (25099)',
+      '25062': 'Тинькофф Мобайл (25062)',
+      '25039': 'Ростелеком (25039)',
+    };
+    return mccMnc[clean] ?? clean;
   }
 
   String _parseCardLock(String raw) {

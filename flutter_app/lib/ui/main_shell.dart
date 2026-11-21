@@ -97,92 +97,94 @@ class _MainShellState extends State<MainShell> {
         body: Row(
           children: [
             // Левое меню с версией и счётчиком непрочитанных SMS
-            Container(
-              width: 236,
+            Material(
               color: Colors.white,
-              child: Column(
-                children: [
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
-                    decoration: const BoxDecoration(
-                      border: Border(
-                        bottom: BorderSide(color: Color(0xFFE2E8F0)),
+              child: SizedBox(
+                width: 236,
+                child: Column(
+                  children: [
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+                      decoration: const BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(color: Color(0xFFE2E8F0)),
+                        ),
+                      ),
+                      child: const Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Huawei E173',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          SizedBox(height: 2),
+                          Text(
+                            'Portable Manager v${AppVersion.version}',
+                            style: TextStyle(fontSize: 11, color: Colors.black54),
+                          ),
+                        ],
                       ),
                     ),
-                    child: const Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Huawei E173',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w700,
+                    Expanded(
+                      child: ListView(
+                        padding: const EdgeInsets.all(8),
+                        children: [
+                          _navBtn(0, Icons.router_outlined, 'Обзор и режимы'),
+                          _navBtn(1, Icons.account_tree_outlined, 'Сценарии'),
+                          _navBtn(2, Icons.table_chart_outlined, 'Таблица Excel'),
+                          _navBtn(
+                            3,
+                            Icons.sms_outlined,
+                            unread > 0 ? 'SMS ($unread)' : 'SMS',
                           ),
-                        ),
-                        SizedBox(height: 2),
-                        Text(
-                          'Portable Manager v${AppVersion.version}',
-                          style: TextStyle(fontSize: 11, color: Colors.black54),
-                        ),
-                      ],
+                          _navBtn(4, Icons.call_outlined, 'Звонки и фразы'),
+                          _navBtn(5, Icons.dialpad_outlined, 'USSD-запросы'),
+                          _navBtn(6, Icons.contacts_outlined, 'Контакты SIM'),
+                          _navBtn(7, Icons.terminal_outlined, 'AT и журнал'),
+                          _navBtn(8, Icons.settings_outlined, 'Настройки'),
+                        ],
+                      ),
                     ),
-                  ),
-                  Expanded(
-                    child: ListView(
-                      padding: const EdgeInsets.all(8),
-                      children: [
-                        _navBtn(0, Icons.router_outlined, 'Обзор и режимы'),
-                        _navBtn(1, Icons.account_tree_outlined, 'Сценарии'),
-                        _navBtn(2, Icons.table_chart_outlined, 'Таблица Excel'),
-                        _navBtn(
-                          3,
-                          Icons.sms_outlined,
-                          unread > 0 ? 'SMS ($unread)' : 'SMS',
-                        ),
-                        _navBtn(4, Icons.call_outlined, 'Звонки и фразы'),
-                        _navBtn(5, Icons.dialpad_outlined, 'USSD-запросы'),
-                        _navBtn(6, Icons.contacts_outlined, 'Контакты SIM'),
-                        _navBtn(7, Icons.terminal_outlined, 'AT и журнал'),
-                        _navBtn(8, Icons.settings_outlined, 'Настройки'),
-                      ],
-                    ),
-                  ),
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(12),
-                    decoration: const BoxDecoration(
-                      border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          c.snapshot.connected
-                              ? '${c.snapshot.port} · ${c.snapshot.simStatus}'
-                              : (c.busy
-                                  ? 'Подключение...'
-                                  : (c.scanningPorts
-                                      ? 'Поиск COM-портов...'
-                                      : 'Модем не подключён')),
-                          style: const TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: const BoxDecoration(
+                        border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            c.snapshot.connected
+                                ? '${c.snapshot.port} · ${c.snapshot.simStatus}'
+                                : (c.busy
+                                    ? 'Подключение...'
+                                    : (c.scanningPorts
+                                        ? 'Поиск COM-портов...'
+                                        : 'Модем не подключён')),
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            overflow: TextOverflow.ellipsis,
                           ),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          'v${AppVersion.version} · Цикл ${c.currentStatusIntervalSec}с',
-                          style: const TextStyle(
-                            fontSize: 11,
-                            color: Colors.black54,
+                          const SizedBox(height: 2),
+                          Text(
+                            'v${AppVersion.version} · Цикл ${c.currentStatusIntervalSec}с',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.black54,
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
             const VerticalDivider(width: 1),

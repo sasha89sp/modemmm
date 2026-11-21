@@ -32,6 +32,7 @@ class VoiceService {
   bool _streamingPhrase = false;
   int _rxBytes = 0;
   int _txBytes = 0;
+  String? lastVoiceError;
   DateTime _lastCounterNotify = DateTime.fromMillisecondsSinceEpoch(0);
 
   VoiceService(this.audio, {this.onChanged});
@@ -72,19 +73,23 @@ class VoiceService {
   /// Запускает двусторонний аудиомост: звуковой COM-порт модема <-> winmm.dll (динамики и микрофон ПК).
   void startVoiceBridge(String comPort) {
     stopVoiceBridge();
+    lastVoiceError = null;
     if (comPort.trim().isEmpty) {
       throw StateError('Не выбран звуковой COM-порт модема.');
     }
     _voicePort.open(comPort, baudRate: 115200);
-    audio.openPcmOut();
+    final outOk = audio.openPcmOut();
+    if (!outOk) {
+      lastVoiceError = 'Не удалось открыть динамики Windows (waveOutOpen).';
+    }
     _bridgeActive = true;
     _rxBytes = 0;
     _txBytes = 0;
 
-    // Приём голоса с модема -> динамики ПК
-    _rxTimer = Timer.periodic(const Duration(milliseconds: 25), (_) {
+    // Приём голоса с модема (8кГц 16-бит моно PCM, 320 байт / 20 мс) -> динамики ПК
+    _rxTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
       if (!_bridgeActive || !_voicePort.isOpen) return;
-      final chunk = _voicePort.readAvailable(maxBytes: 1600);
+      final chunk = _voicePort.readAvailable(maxBytes: 3200);
       if (chunk.isNotEmpty) {
         _rxBytes += chunk.length;
         if (!_speakerMuted) {
@@ -94,8 +99,8 @@ class VoiceService {
       }
     });
 
-    // Захват с микрофона ПК -> звуковой COM-порт модема
-    audio.startMicCapture(onChunk: (pcm) {
+    // Захват с микрофона ПК (320 байт / 20 мс) -> звуковой COM-порт модема
+    final micOk = audio.startMicCapture(onChunk: (pcm) {
       if (!_bridgeActive || !_voicePort.isOpen || _micMuted || _streamingPhrase) {
         return;
       }
@@ -103,10 +108,14 @@ class VoiceService {
         _voicePort.writeBytes(pcm);
         _txBytes += pcm.length;
         _notifyCountersThrottled();
-      } catch (_) {
+      } catch (e) {
+        lastVoiceError = 'Ошибка записи в голосовой порт: $e';
         stopVoiceBridge();
       }
     });
+    if (!micOk) {
+      lastVoiceError = 'Микрофон ПК недоступен (динамики работают на приём).';
+    }
     onChanged?.call();
   }
 

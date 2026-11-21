@@ -5,7 +5,8 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
-// Win32 WAVEFORMATEX (18 байт)
+// Win32 WAVEFORMATEX (ровно 18 байт)
+@Packed(2)
 final class WAVEFORMATEX extends Struct {
   @Uint16()
   external int wFormatTag;
@@ -145,15 +146,16 @@ class WinmmAudio {
 
   Pointer<Uint8>? _lastChimeBuf;
 
-  // Streaming waveOut (8kHz 16-bit mono PCM)
+  // Streaming waveOut (8kHz 16-bit mono PCM) с безопасным освобождением по WHDR_DONE
   int _hWaveOut = 0;
-  // Streaming waveIn (8kHz 16-bit mono PCM)
+  final List<(Pointer<WAVEHDR>, Pointer<Uint8>)> _outQueue = [];
+
+  // Streaming waveIn (8kHz 16-bit mono PCM, 4 ротируемых буфера по 320 байт = 20 мс)
   int _hWaveIn = 0;
   bool _recording = false;
   final List<int> _recordedPcm = [];
   Timer? _waveInPollTimer;
-  Pointer<WAVEHDR>? _inHdr;
-  Pointer<Uint8>? _inBuf;
+  final List<(Pointer<WAVEHDR>, Pointer<Uint8>)> _inRing = [];
   void Function(Uint8List pcm)? _onMicChunk;
 
   bool get isRecording => _recording;
@@ -249,8 +251,27 @@ class WinmmAudio {
     }
   }
 
+  void _reclaimCompletedOutBuffers() {
+    if (_hWaveOut == 0 || _outQueue.isEmpty) return;
+    _outQueue.removeWhere((pair) {
+      final hdr = pair.$1;
+      final buf = pair.$2;
+      if ((hdr.ref.dwFlags & _whdrDone) != 0) {
+        _waveOutUnprepareHeader(_hWaveOut, hdr, sizeOf<WAVEHDR>());
+        calloc.free(buf);
+        calloc.free(hdr);
+        return true;
+      }
+      return false;
+    });
+  }
+
   void writePcmOut(Uint8List pcm) {
     if (!Platform.isWindows || _hWaveOut == 0 || pcm.isEmpty) return;
+    _reclaimCompletedOutBuffers();
+    // Защита от накопления слишком длинной очереди (если драйвер подвис)
+    if (_outQueue.length > 64) return;
+
     final buf = calloc<Uint8>(pcm.length);
     final hdr = calloc<WAVEHDR>();
     buf.asTypedList(pcm.length).setAll(0, pcm);
@@ -259,15 +280,13 @@ class WinmmAudio {
     hdr.ref.dwFlags = 0;
 
     if (_waveOutPrepareHeader(_hWaveOut, hdr, sizeOf<WAVEHDR>()) == 0) {
-      _waveOutWrite(_hWaveOut, hdr, sizeOf<WAVEHDR>());
-      // Освобождаем буфер после воспроизведения (20мс буфер -> освобождаем с запасом)
-      Future.delayed(const Duration(milliseconds: 250), () {
-        if (_hWaveOut != 0) {
-          _waveOutUnprepareHeader(_hWaveOut, hdr, sizeOf<WAVEHDR>());
-        }
+      if (_waveOutWrite(_hWaveOut, hdr, sizeOf<WAVEHDR>()) == 0) {
+        _outQueue.add((hdr, buf));
+      } else {
+        _waveOutUnprepareHeader(_hWaveOut, hdr, sizeOf<WAVEHDR>());
         calloc.free(buf);
         calloc.free(hdr);
-      });
+      }
     } else {
       calloc.free(buf);
       calloc.free(hdr);
@@ -277,12 +296,18 @@ class WinmmAudio {
   void closePcmOut() {
     if (_hWaveOut != 0) {
       _waveOutReset(_hWaveOut);
+      for (final pair in _outQueue) {
+        _waveOutUnprepareHeader(_hWaveOut, pair.$1, sizeOf<WAVEHDR>());
+        calloc.free(pair.$2);
+        calloc.free(pair.$1);
+      }
+      _outQueue.clear();
       _waveOutClose(_hWaveOut);
       _hWaveOut = 0;
     }
   }
 
-  /// Запускает захват с микрофона ПК (8кГц 16-бит моно PCM).
+  /// Запускает непрерывный захват с микрофона ПК: 4 ротируемых буфера по 320 байт (20 мс @ 8кГц 16-бит моно).
   bool startMicCapture({void Function(Uint8List pcm)? onChunk}) {
     if (!Platform.isWindows) return false;
     stopMicCapture();
@@ -301,32 +326,45 @@ class WinmmAudio {
       calloc.free(fmt);
     }
 
-    const chunkSize = 1600; // 100 ms @ 8kHz 16-bit mono
-    _inBuf = calloc<Uint8>(chunkSize);
-    _inHdr = calloc<WAVEHDR>();
-    _inHdr!.ref.lpData = _inBuf!;
-    _inHdr!.ref.dwBufferLength = chunkSize;
-    _inHdr!.ref.dwFlags = 0;
+    // Huawei E173 (^CVOICE:0,8000,16,20) работает фреймами строго 320 байт / 20 мс
+    const chunkSize = 320;
+    const bufferCount = 4;
+    for (var i = 0; i < bufferCount; i++) {
+      final buf = calloc<Uint8>(chunkSize);
+      final hdr = calloc<WAVEHDR>();
+      hdr.ref.lpData = buf;
+      hdr.ref.dwBufferLength = chunkSize;
+      hdr.ref.dwFlags = 0;
+      _waveInPrepareHeader(_hWaveIn, hdr, sizeOf<WAVEHDR>());
+      _waveInAddBuffer(_hWaveIn, hdr, sizeOf<WAVEHDR>());
+      _inRing.add((hdr, buf));
+    }
 
-    _waveInPrepareHeader(_hWaveIn, _inHdr!, sizeOf<WAVEHDR>());
-    _waveInAddBuffer(_hWaveIn, _inHdr!, sizeOf<WAVEHDR>());
     _waveInStart(_hWaveIn);
     _recording = true;
 
-    _waveInPollTimer = Timer.periodic(const Duration(milliseconds: 35), (_) {
-      if (!_recording || _hWaveIn == 0 || _inHdr == null) return;
-      if ((_inHdr!.ref.dwFlags & _whdrDone) != 0) {
-        final recorded = _inHdr!.ref.dwBytesRecorded;
-        if (recorded > 0) {
-          final bytes = Uint8List.fromList(_inBuf!.asTypedList(recorded));
-          _recordedPcm.addAll(bytes);
-          _onMicChunk?.call(bytes);
+    _waveInPollTimer = Timer.periodic(const Duration(milliseconds: 15), (_) {
+      if (!_recording || _hWaveIn == 0 || _inRing.isEmpty) return;
+      for (final pair in _inRing) {
+        final hdr = pair.$1;
+        final buf = pair.$2;
+        if ((hdr.ref.dwFlags & _whdrDone) != 0) {
+          final recorded = hdr.ref.dwBytesRecorded;
+          if (recorded > 0) {
+            final bytes = Uint8List.fromList(buf.asTypedList(recorded));
+            if (_onMicChunk == null) {
+              // Храним буфер в RAM только при записи WAV-фразы (не при бесконечном звонке)
+              _recordedPcm.addAll(bytes);
+            } else {
+              _onMicChunk?.call(bytes);
+            }
+          }
+          _waveInUnprepareHeader(_hWaveIn, hdr, sizeOf<WAVEHDR>());
+          hdr.ref.dwFlags = 0;
+          hdr.ref.dwBytesRecorded = 0;
+          _waveInPrepareHeader(_hWaveIn, hdr, sizeOf<WAVEHDR>());
+          _waveInAddBuffer(_hWaveIn, hdr, sizeOf<WAVEHDR>());
         }
-        _waveInUnprepareHeader(_hWaveIn, _inHdr!, sizeOf<WAVEHDR>());
-        _inHdr!.ref.dwFlags = 0;
-        _inHdr!.ref.dwBytesRecorded = 0;
-        _waveInPrepareHeader(_hWaveIn, _inHdr!, sizeOf<WAVEHDR>());
-        _waveInAddBuffer(_hWaveIn, _inHdr!, sizeOf<WAVEHDR>());
       }
     });
     return true;
@@ -342,19 +380,20 @@ class WinmmAudio {
     if (_hWaveIn != 0) {
       _waveInStop(_hWaveIn);
       _waveInReset(_hWaveIn);
-      if (_inHdr != null) {
-        _waveInUnprepareHeader(_hWaveIn, _inHdr!, sizeOf<WAVEHDR>());
+      for (final pair in _inRing) {
+        _waveInUnprepareHeader(_hWaveIn, pair.$1, sizeOf<WAVEHDR>());
+        calloc.free(pair.$2);
+        calloc.free(pair.$1);
       }
+      _inRing.clear();
       _waveInClose(_hWaveIn);
       _hWaveIn = 0;
-    }
-    if (_inHdr != null) {
-      calloc.free(_inHdr!);
-      _inHdr = null;
-    }
-    if (_inBuf != null) {
-      calloc.free(_inBuf!);
-      _inBuf = null;
+    } else {
+      for (final pair in _inRing) {
+        calloc.free(pair.$2);
+        calloc.free(pair.$1);
+      }
+      _inRing.clear();
     }
     return Uint8List.fromList(_recordedPcm);
   }

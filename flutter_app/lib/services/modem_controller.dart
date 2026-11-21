@@ -60,6 +60,9 @@ class ModemController extends ChangeNotifier {
   final List<String> scenarioProgressLog = [];
 
   String? incomingCallerNumber;
+  String callStateBanner = '';
+  String voiceCapabilityStatus = 'Не проверено';
+  bool? voiceCapabilityEnabled;
   String rasStatus = 'Отключено';
   String? lastToastMessage;
   bool busy = false;
@@ -350,6 +353,7 @@ class ModemController extends ChangeNotifier {
       _emitToast('Подключено к $port (${next.model})');
 
       if (!next.simMissing) {
+        await checkVoiceCapability();
         await refreshSmsDiagnostics();
         if (settings.autoFetchSms) {
           unawaited(syncSmsFromModem(silent: true));
@@ -375,6 +379,9 @@ class ModemController extends ChangeNotifier {
     final prevPort = serial.portName;
     serial.close();
     incomingCallerNumber = null;
+    callStateBanner = '';
+    voiceCapabilityStatus = 'Не проверено';
+    voiceCapabilityEnabled = null;
     activeCalls = [];
     _applySnapshotIfChanged(const ModemSnapshot());
     if (prevPort != null) {
@@ -387,6 +394,7 @@ class ModemController extends ChangeNotifier {
   void _handleUnexpectedUsbDisconnect(String reason) {
     voice.stopVoiceBridge();
     incomingCallerNumber = null;
+    callStateBanner = '';
     activeCalls = [];
     _applySnapshotIfChanged(const ModemSnapshot());
     db.logSystem('WARN', 'Мгновенное освобождение порта: $reason');
@@ -411,18 +419,71 @@ class ModemController extends ChangeNotifier {
       _safeNotify();
     } else if (line == 'RING') {
       incomingCallerNumber ??= 'Входящий вызов...';
+      callStateBanner = 'Входящий вызов (RING)';
       _safeNotify();
     } else if (line.startsWith('+CLIP:')) {
       final m = RegExp(r'\+CLIP:\s*"([^"]+)"').firstMatch(line);
       if (m != null) {
         incomingCallerNumber = m.group(1);
+        callStateBanner = 'Входящий вызов: ${m.group(1)}';
         _safeNotify();
       }
+    } else if (line.startsWith('^ORIG:')) {
+      callStateBanner = 'Набор номера (^ORIG)...';
+      _safeNotify();
+    } else if (line.startsWith('^CONF:')) {
+      callStateBanner = 'Идут гудки (^CONF)...';
+      _safeNotify();
+    } else if (line.startsWith('^CONN:')) {
+      callStateBanner = 'Разговор активен (^CONN)';
+      db.logSystem('INFO', 'Соединение установлено: $line');
+      _bumpLogsVersion();
+      // На Huawei E173 обязательно активируем AT^DDSETEX=2 именно после ^CONN:
+      unawaited(_activateVoiceAudioOnConnect());
+      _safeNotify();
     } else if (line.startsWith('^CEND:')) {
       incomingCallerNumber = null;
+      callStateBanner = '';
+      activeCalls = [];
       voice.stopVoiceBridge();
+      db.logSystem('INFO', 'Вызов завершён: $line');
+      _bumpLogsVersion();
       _safeNotify();
     }
+  }
+
+  Future<void> _activateVoiceAudioOnConnect() async {
+    if (!serial.isOpen) return;
+    try {
+      await modem.enableHuaweiVoiceChannel();
+      final voicePort = settings.preferredVoicePort;
+      if (voicePort.isNotEmpty &&
+          voicePort != serial.portName &&
+          !voice.isBridgeActive) {
+        voice.startVoiceBridge(voicePort);
+      }
+      await refreshActiveCalls();
+    } catch (e) {
+      db.logSystem('WARN', 'Не удалось открыть аудиоканал после ^CONN: $e');
+      _bumpLogsVersion();
+    }
+  }
+
+  Future<void> checkVoiceCapability() async {
+    if (!serial.isOpen) return;
+    final (enabled, raw) = await modem.queryVoiceCapability();
+    voiceCapabilityEnabled = enabled;
+    voiceCapabilityStatus = enabled
+        ? 'Голос включён ($raw)'
+        : 'Голос отключён в прошивке ($raw)';
+    _safeNotify();
+  }
+
+  Future<(bool ok, String raw)> tryEnableVoiceCapability() async {
+    if (!serial.isOpen) return (false, 'Модем не подключён');
+    final res = await modem.enableVoiceCapability();
+    await checkVoiceCapability();
+    return res;
   }
 
   void _applySnapshotIfChanged(ModemSnapshot next) {
@@ -498,9 +559,15 @@ class ModemController extends ChangeNotifier {
     _statusLoopTimer?.cancel();
     final sec = currentStatusIntervalSec;
     _statusLoopTimer = Timer.periodic(Duration(seconds: sec), (_) async {
+      // Не дёргаем фоновые AT-команды (AT+CPIN?/COPS?) во время активного звонка
+      final inActiveCall = activeCalls.isNotEmpty ||
+          voice.isBridgeActive ||
+          callStateBanner.isNotEmpty ||
+          incomingCallerNumber != null;
       if (_statusLoopRunning ||
           _disposed ||
           busy ||
+          inActiveCall ||
           !serial.isOpen ||
           serial.isBusy ||
           scenarioEngine.isRunning) {
